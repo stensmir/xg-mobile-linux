@@ -166,11 +166,11 @@ Game Mode external display is an open architectural limitation in [gamescope](ht
 
 | Dock | GPU | Status |
 |------|-----|--------|
-| GC31R | RTX 3080 Mobile | Should work |
-| GC31S | RTX 3080 Ti | Should work |
-| GC32L | RX 6850M XT (AMD) | Needs amdgpu path, not covered by this plugin |
-| GC33Y | RTX 4090 Mobile | Should work |
-| GC33Z | RTX 4090 | **Confirmed** |
+| GC31R | RTX 3080 Mobile | Should work (NVIDIA path) |
+| GC31S | RTX 3080 Ti | Should work (NVIDIA path) |
+| GC32L | RX 6850M XT (AMD) | **Experimental AMD path** — activation verified by community on Bazzite, plugin path untested on stock SteamOS. Use "Copy diagnostics" + open issue if you try it. |
+| GC33Y | RTX 4090 Mobile | Should work (NVIDIA path) |
+| GC33Z | RTX 4090 | **Confirmed (NVIDIA path)** |
 | USB-C XG Mobile (e.g. RTX 5090) | RTX 5090 | Should work — same `asus-wmi` path |
 
 ## Project structure
