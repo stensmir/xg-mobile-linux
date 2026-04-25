@@ -1,20 +1,36 @@
 #!/bin/bash
-# xgm-auto — Auto-detect XG Mobile and load nvidia only if connected.
+# xgm-auto — Auto-detect XG Mobile at boot and bring up the eGPU.
 #
 # Called by systemd at boot (xg-mobile-auto.service).
 # NEVER put nvidia in /etc/modules-load.d/ — this script handles it.
 #
+# Vendor (nvidia | amd) read from /home/deck/.config/xgm/vendor
+# (default: nvidia, for backward compat with installs predating AMD branch).
+#
 # Logic:
-#   Boot → check egpu_connected sysfs → if 1 → activate + modprobe nvidia
-#                                        if 0 → do nothing, AMD-only boot
+#   Boot → check egpu_connected sysfs → if 1 → activate (vendor-specific)
+#                                       if 0 → do nothing, iGPU-only boot
 
 SYSFS_CONNECTED="/sys/devices/platform/asus-nb-wmi/egpu_connected"
 SYSFS_ENABLE="/sys/devices/platform/asus-nb-wmi/egpu_enable"
+VENDOR_FILE="/home/deck/.config/xgm/vendor"
 LOGFILE="/var/log/xgm-auto.log"
 
 log() {
     echo "$(date '+%F %T') xgm-auto: $*" | tee -a "$LOGFILE"
 }
+
+read_vendor() {
+    if [ -r "$VENDOR_FILE" ]; then
+        v=$(tr -d '[:space:]' < "$VENDOR_FILE")
+        case "$v" in
+            nvidia|amd) echo "$v"; return ;;
+        esac
+    fi
+    echo "nvidia"
+}
+
+VENDOR=$(read_vendor)
 
 case "${1:-start}" in
     start)
@@ -26,68 +42,88 @@ case "${1:-start}" in
         CONNECTED=$(cat "$SYSFS_CONNECTED" 2>/dev/null)
 
         if [ "$CONNECTED" = "1" ]; then
-            log "XG Mobile DETECTED. Activating eGPU..."
+            log "XG Mobile DETECTED (vendor=$VENDOR). Activating eGPU..."
 
-            # Step 1: ACPI activation
+            # Step 1: ACPI activation (universal)
             echo 1 > "$SYSFS_ENABLE" 2>/dev/null
             log "egpu_enable = 1"
 
-            # Step 2: PCIe rescan
+            # Step 2: PCIe rescan (universal)
             sleep 2
             echo 1 > /sys/bus/pci/rescan 2>/dev/null
             log "PCIe rescan done"
 
-            # Step 3: Load nvidia driver (NO nvidia-drm — it steals DRM minor 0
-            # from amdgpu and crashes gamescope. Games use DXVK/Vulkan directly.)
             sleep 2
-            modprobe nvidia 2>/dev/null
-            modprobe nvidia-uvm 2>/dev/null
-            modprobe nvidia-drm modeset=1 2>/dev/null  # blacklisted at boot, but games need it
-            log "nvidia modules loaded (nvidia-drm loaded at runtime, blacklisted at boot)"
 
-            # Step 4: Verify via sysfs (nvidia-smi needs nvidia-utils, may not be installed)
-            sleep 2
+            if [ "$VENDOR" = "nvidia" ]; then
+                # Load nvidia driver. nvidia-drm is blacklisted at boot
+                # (see /etc/modprobe.d/blacklist-nvidia-drm.conf) so we
+                # explicitly modprobe it with modeset=1 here.
+                modprobe nvidia 2>/dev/null
+                modprobe nvidia-uvm 2>/dev/null
+                modprobe nvidia-drm modeset=1 2>/dev/null
+                log "nvidia modules loaded"
+                EXPECTED_VENDOR="0x10de"
+            else
+                # AMD: amdgpu auto-binds on rescan. Nothing to modprobe.
+                log "AMD path — amdgpu auto-binds, no modprobe needed"
+                EXPECTED_VENDOR="0x1002"
+            fi
+
+            # Verify the dock GPU appeared on the PCI bus.
+            # Skip 0000:09:* — that's the integrated AMD iGPU on Z1 Extreme.
             GPU_ON_BUS=0
             for dev in /sys/bus/pci/devices/*; do
                 vendor=$(cat "$dev/vendor" 2>/dev/null)
-                if [ "$vendor" = "0x10de" ]; then
+                bdf=$(basename "$dev")
+                if [ "$vendor" = "$EXPECTED_VENDOR" ] && [[ "$bdf" != 0000:09:* ]]; then
                     GPU_ON_BUS=1
                     break
                 fi
             done
             if [ "$GPU_ON_BUS" = "1" ]; then
-                log "SUCCESS: NVIDIA GPU on PCIe bus"
+                log "SUCCESS: $VENDOR dock GPU on PCIe bus"
             else
-                log "WARNING: GPU not found on PCIe bus"
+                log "WARNING: dock GPU not found on PCIe bus"
             fi
         else
-            log "XG Mobile NOT connected. AMD-only boot. nvidia not loaded."
+            log "XG Mobile NOT connected. iGPU-only boot."
         fi
         ;;
 
     stop)
-        # Safe removal: PCIe remove first, then modprobe -r, then ACPI disable
-        log "Stopping eGPU..."
+        # Safe removal: PCIe remove the dock GPU first, then unload modules
+        # (nvidia only), then ACPI disable.
+        log "Stopping eGPU (vendor=$VENDOR)..."
 
-        # PCIe remove all nvidia devices (frees driver even if refcount > 0)
+        if [ "$VENDOR" = "nvidia" ]; then
+            REMOVE_VENDOR="0x10de"
+        else
+            REMOVE_VENDOR="0x1002"
+        fi
+
+        # PCIe remove dock GPUs (skip iGPU at 09:*)
         for dev in /sys/bus/pci/devices/*; do
             vendor=$(cat "$dev/vendor" 2>/dev/null)
-            if [ "$vendor" = "0x10de" ]; then
-                bdf=$(basename "$dev")
+            bdf=$(basename "$dev")
+            if [ "$vendor" = "$REMOVE_VENDOR" ] && [[ "$bdf" != 0000:09:* ]]; then
                 log "Removing PCIe device $bdf"
                 echo 1 > "$dev/remove" 2>/dev/null
             fi
         done
 
-        # Now try unloading modules (should succeed after PCIe remove)
-        if lsmod | grep -q "^nvidia"; then
-            modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null
+        if [ "$VENDOR" = "nvidia" ]; then
+            # Unload nvidia modules (should succeed after PCIe remove)
             if lsmod | grep -q "^nvidia"; then
-                log "WARN: nvidia modules still loaded (non-critical)"
-            else
-                log "nvidia modules unloaded"
+                modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null
+                if lsmod | grep -q "^nvidia"; then
+                    log "WARN: nvidia modules still loaded (non-critical)"
+                else
+                    log "nvidia modules unloaded"
+                fi
             fi
         fi
+        # AMD: amdgpu typically releases cleanly on PCIe remove; no module unload.
 
         if [ -f "$SYSFS_ENABLE" ]; then
             echo 0 > "$SYSFS_ENABLE" 2>/dev/null

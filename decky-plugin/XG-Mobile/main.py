@@ -13,6 +13,14 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_SCRIPTS = os.path.join(PLUGIN_DIR, "scripts")
 PLUGIN_SYSTEMD = os.path.join(PLUGIN_DIR, "systemd")
 
+# eGPU vendor selection (nvidia or amd) — recorded at install time, read by
+# activate / deactivate / status / uninstall to branch the codepath. Single
+# file with one word: "nvidia" or "amd".
+VENDOR_DIR = "/home/deck/.config/xgm"
+VENDOR_FILE = f"{VENDOR_DIR}/vendor"
+PCI_VENDOR_NVIDIA = "0x10de"
+PCI_VENDOR_AMD    = "0x1002"
+
 # ── Logging ──────────────────────────────────────────────
 LOG_DIR = os.path.expanduser("~/homebrew/logs/XG-Mobile")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -96,6 +104,41 @@ def _unload_nvidia():
     """Unload all nvidia kernel modules in dependency order."""
     _run("modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null")
 
+def _read_vendor():
+    """Read the recorded eGPU vendor. Default: 'nvidia' for backward compat
+    with installs that pre-date the AMD branch."""
+    v = _read(VENDOR_FILE).strip().lower()
+    return v if v in ("nvidia", "amd") else "nvidia"
+
+def _write_vendor(vendor):
+    """Persist the install vendor so subsequent activate/deactivate know which
+    codepath to take. Caller is responsible for validation."""
+    try:
+        os.makedirs(VENDOR_DIR, exist_ok=True)
+        with open(VENDOR_FILE, "w") as f:
+            f.write(vendor)
+        return True
+    except Exception as e:
+        log.error(f"_write_vendor: {e}")
+        return False
+
+def _scan_pci_vendor():
+    """Walk /sys/bus/pci/devices/*/vendor and return the first GPU vendor
+    found (nvidia | amd | ''). Used post-activation to confirm what binds."""
+    import glob as g
+    for vp in g.glob("/sys/bus/pci/devices/*/vendor"):
+        v = _read(vp)
+        if v == PCI_VENDOR_NVIDIA:
+            return "nvidia"
+        if v == PCI_VENDOR_AMD:
+            # Skip the integrated AMD iGPU on Z1 Extreme (lives at 09:00.0).
+            # Only count AMD GPUs on the dock — they appear on bus 01:xx.x
+            # after egpu_enable + rescan.
+            bdf = os.path.basename(os.path.dirname(vp))
+            if not bdf.startswith("0000:09:"):
+                return "amd"
+    return ""
+
 def _pcie_remove_nvidia():
     """Remove all nvidia PCIe devices via sysfs."""
     import glob as g
@@ -149,15 +192,22 @@ class Plugin:
         try:
             connected = _read("/sys/devices/platform/asus-nb-wmi/egpu_connected") == "1"
             enabled = _read("/sys/devices/platform/asus-nb-wmi/egpu_enable") == "1"
+            vendor = _read_vendor()
 
-            # Fast GPU-on-bus check via sysfs instead of slow lspci
+            # Fast GPU-on-bus check via sysfs instead of slow lspci.
+            # NVIDIA vendor 0x10de — anywhere on bus.
+            # AMD vendor 0x1002 — only count dock GPUs (not the iGPU at 09:00.0).
             gpu_on_bus = False
             try:
                 import glob as g
                 for dev in g.glob("/sys/bus/pci/devices/*/vendor"):
-                    if _read(dev) == "0x10de":  # NVIDIA vendor ID
-                        gpu_on_bus = True
-                        break
+                    v = _read(dev)
+                    if vendor == "nvidia" and v == PCI_VENDOR_NVIDIA:
+                        gpu_on_bus = True; break
+                    if vendor == "amd" and v == PCI_VENDOR_AMD:
+                        bdf = os.path.basename(os.path.dirname(dev))
+                        if not bdf.startswith("0000:09:"):
+                            gpu_on_bus = True; break
             except Exception:
                 pass
 
@@ -167,22 +217,34 @@ class Plugin:
             gpu_mem_total = ""
             gpu_power = ""
 
-            nvidia_installed = os.path.exists("/usr/bin/nvidia-smi") or os.path.exists("/usr/sbin/nvidia-smi")
-
-            nvidia_working = False
-            if nvidia_installed and gpu_on_bus:
-                rc, _ = _run_user("nvidia-smi -L 2>/dev/null", timeout=5)
-                nvidia_working = rc == 0
-
-            if nvidia_installed and gpu_on_bus and nvidia_working:
-                rc, out = _run_user("nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,power.default_limit --format=csv,noheader,nounits 2>/dev/null", timeout=5)
-                if rc == 0 and "," in out:
-                    parts = [p.strip() for p in out.split(",")]
-                    gpu_name = parts[0] if len(parts) > 0 else ""
-                    gpu_temp = parts[1] if len(parts) > 1 else ""
-                    gpu_mem = parts[2] if len(parts) > 2 else ""
-                    gpu_mem_total = parts[3] if len(parts) > 3 else ""
-                    gpu_power = parts[4] if len(parts) > 4 else ""
+            # "driver_installed" / "driver_working" — vendor-agnostic naming
+            # in the API. Frontend types still call them nvidia_* for backward
+            # compat with the existing UI.
+            if vendor == "nvidia":
+                driver_installed = os.path.exists("/usr/bin/nvidia-smi") or os.path.exists("/usr/sbin/nvidia-smi")
+                driver_working = False
+                if driver_installed and gpu_on_bus:
+                    rc, _ = _run_user("nvidia-smi -L 2>/dev/null", timeout=5)
+                    driver_working = rc == 0
+                if driver_installed and gpu_on_bus and driver_working:
+                    rc, out = _run_user("nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,power.default_limit --format=csv,noheader,nounits 2>/dev/null", timeout=5)
+                    if rc == 0 and "," in out:
+                        parts = [p.strip() for p in out.split(",")]
+                        gpu_name = parts[0] if len(parts) > 0 else ""
+                        gpu_temp = parts[1] if len(parts) > 1 else ""
+                        gpu_mem = parts[2] if len(parts) > 2 else ""
+                        gpu_mem_total = parts[3] if len(parts) > 3 else ""
+                        gpu_power = parts[4] if len(parts) > 4 else ""
+            else:
+                # AMD: amdgpu is in the kernel — "installed" means scripts/units
+                # are in place. "Working" means the dock GPU is on the PCI bus.
+                driver_installed = os.path.exists("/usr/local/bin/xgm-auto") and os.path.exists(VENDOR_FILE)
+                driver_working = driver_installed and gpu_on_bus
+                if driver_working:
+                    rc_lspci, lspci_out = _run("lspci -nn | awk '/VGA|3D/ && /1002:/ && !/09:00.0/{print; exit}'", timeout=5)
+                    gpu_name = lspci_out.strip() if rc_lspci == 0 else "AMD eGPU"
+                    # No equivalent of nvidia-smi — leave temp/power/mem empty for now.
+                    # radeontop / sysfs hwmon could fill these in later if requested.
 
             result = {
                 "connected": connected,
@@ -193,17 +255,21 @@ class Plugin:
                 "gpu_mem": gpu_mem,
                 "gpu_mem_total": gpu_mem_total,
                 "gpu_power": gpu_power,
-                "nvidia_installed": nvidia_installed,
-                "nvidia_working": nvidia_working,
+                "vendor": vendor,
+                # Backward-compatible aliases for the existing UI:
+                "nvidia_installed": driver_installed,
+                "nvidia_working": driver_working,
             }
-            log.info(f"get_status: connected={connected} enabled={enabled} gpu_on_bus={gpu_on_bus} "
-                     f"nvidia_installed={nvidia_installed} nvidia_working={nvidia_working} gpu={gpu_name}")
+            log.info(f"get_status: vendor={vendor} connected={connected} enabled={enabled} "
+                     f"gpu_on_bus={gpu_on_bus} driver_installed={driver_installed} "
+                     f"driver_working={driver_working} gpu={gpu_name}")
             return result
         except Exception as e:
             log.error(f"get_status EXCEPTION: {e}")
             return {
                 "connected": False, "enabled": False, "gpu_on_bus": False,
                 "gpu_name": "", "gpu_temp": "", "gpu_mem": "", "gpu_power": "",
+                "vendor": "nvidia",
                 "nvidia_installed": False, "nvidia_working": False,
                 "error": f"get_status failed: {e}",
             }
@@ -231,6 +297,85 @@ class Plugin:
         except Exception as e:
             log.error(f"setup_sudo EXCEPTION: {e}")
             return {"success": False, "error": str(e)}
+
+    async def install_amd(self):
+        """Install for AMD XG Mobile docks (GC32L). Much shorter than nvidia —
+        no DKMS, no pacman, no modprobe blacklists. Just: ensure /home/deck
+        scratch dirs, install scripts and systemd units, record vendor=amd."""
+        global _operation
+        log.info("install_amd: called")
+        if _operation is not None:
+            return {"success": False, "error": "already_running",
+                    "msg": f"{_operation.capitalize()} already in progress"}
+        try:
+            os.remove(PROGRESS_FILE)
+        except Exception:
+            pass
+        rc_sudo, _ = _run("echo ok", timeout=5)
+        if rc_sudo != 0:
+            return {"success": False, "error": "needs_password",
+                    "msg": "Password required. Use Setup first."}
+        _operation = "installing"
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._install_amd_sync)
+
+    def _install_amd_sync(self):
+        global _operation
+        _operation = "installing"
+        total = 3
+
+        def step(n, msg, cmd, timeout=120, critical=True):
+            _progress(n, total, msg)
+            rc, out = _run(cmd, timeout=timeout)
+            if rc != 0:
+                _progress(n, total, f"FAILED: {msg}")
+                if critical:
+                    raise StepError(n, msg, out)
+            return rc, out
+
+        try:
+            step(1, "Disabling read-only filesystem...",
+                 "steamos-readonly disable; "
+                 "rm -f /var/lib/pacman/db.lck /usr/lib/holo/pacmandb/db.lck 2>/dev/null; true")
+            step(2, "Preparing scratch directories...",
+                 "mkdir -p /home/deck/.xgm/tmp && chown -R deck:deck /home/deck/.xgm")
+            step(3, "Installing auto-detect + safe-shutdown services...",
+                 f'install -m 755 "{PLUGIN_SCRIPTS}/xgm-auto" /usr/local/bin/xgm-auto && '
+                 f'install -m 755 "{PLUGIN_SCRIPTS}/xgm-shutdown" /usr/local/bin/xgm-shutdown && '
+                 f'install -m 644 "{PLUGIN_SYSTEMD}/xg-mobile-auto.service" /etc/systemd/system/xg-mobile-auto.service && '
+                 f'install -m 644 "{PLUGIN_SYSTEMD}/xg-mobile-shutdown.service" /etc/systemd/system/xg-mobile-shutdown.service && '
+                 'systemctl daemon-reload && systemctl enable xg-mobile-auto.service xg-mobile-shutdown.service',
+                 critical=False)
+
+            _write_vendor("amd")
+            log.info("install_amd: vendor=amd recorded")
+
+            # Probe activation — see if amdgpu picks up the GPU on bus
+            connected = _read("/sys/devices/platform/asus-nb-wmi/egpu_connected") == "1"
+            gpu_name = ""
+            if connected:
+                _run("echo 1 > /sys/devices/platform/asus-nb-wmi/egpu_enable")
+                import time; time.sleep(2)
+                _run("echo 1 > /sys/bus/pci/rescan")
+                time.sleep(2)
+                vendor_found = _scan_pci_vendor()
+                if vendor_found == "amd":
+                    rc_lspci, lspci_out = _run("lspci -nn | awk '/VGA|3D/ && /1002:/{print; exit}'")
+                    gpu_name = lspci_out.strip()
+                    log.info(f"install_amd: probe found AMD GPU: {gpu_name}")
+
+            _progress(total, total, "AMD support installed.")
+            return {"success": True, "vendor": "amd", "gpu": gpu_name or "AMD eGPU"}
+        except StepError as e:
+            _progress(total, total, f"Failed at step {e.step}: {e.msg}")
+            return {"success": False, "error": f"Step {e.step} ({e.msg}) failed: {e.output[:300]}",
+                    "failed_step": e.step}
+        except Exception as e:
+            _progress(total, total, f"Critical error: {str(e)}")
+            return {"success": False, "error": str(e)}
+        finally:
+            _operation = None
+            _install_cleanup()
 
     async def install_nvidia(self):
         """Run install in a thread so get_progress() can respond during long steps."""
@@ -364,6 +509,9 @@ class Plugin:
                  "modprobe nvidia && modprobe nvidia-uvm && modprobe nvidia-drm modeset=1",
                  critical=False)
 
+            _write_vendor("nvidia")
+            log.info("install: vendor=nvidia recorded")
+
             # ── Verification (prefer nvidia-smi if available, fallback to sysfs) ──
             gpu_name = ""
             try:
@@ -429,6 +577,8 @@ class Plugin:
     def _activate_egpu_sync(self):
         try:
             import time
+            vendor = _read_vendor()
+            log.info(f"activate_egpu: vendor={vendor}")
 
             # Skip ACPI write if already enabled (prevents I/O error on retry)
             already_enabled = _read("/sys/devices/platform/asus-nb-wmi/egpu_enable") == "1"
@@ -455,18 +605,26 @@ class Plugin:
             log.info("activate_egpu: waiting 2s for device enumeration")
             time.sleep(2)
 
-            log.info("activate_egpu: loading nvidia modules")
-            rc, out = _run("modprobe nvidia")
-            log.info(f"activate_egpu: modprobe nvidia rc={rc} out={out[:200]}")
-            rc, out = _run("modprobe nvidia-uvm")
-            log.info(f"activate_egpu: modprobe nvidia-uvm rc={rc}")
-            # nvidia-drm is blacklisted (won't auto-load at boot) but games need it at runtime
-            rc, out = _run("modprobe nvidia-drm modeset=1")
-            log.info(f"activate_egpu: modprobe nvidia-uvm rc={rc}")
+            gpu_name = ""
+            if vendor == "nvidia":
+                log.info("activate_egpu: loading nvidia modules")
+                rc, out = _run("modprobe nvidia")
+                log.info(f"activate_egpu: modprobe nvidia rc={rc} out={out[:200]}")
+                rc, out = _run("modprobe nvidia-uvm")
+                log.info(f"activate_egpu: modprobe nvidia-uvm rc={rc}")
+                # nvidia-drm is blacklisted (won't auto-load at boot) but games need it at runtime
+                rc, out = _run("modprobe nvidia-drm modeset=1")
+                log.info(f"activate_egpu: modprobe nvidia-drm rc={rc}")
 
-            rc, smi = _run("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null")
-            gpu_name = smi.strip() if rc == 0 else ""
-            log.info(f"activate_egpu: nvidia-smi rc={rc} gpu={gpu_name}")
+                rc, smi = _run("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null")
+                gpu_name = smi.strip() if rc == 0 else ""
+                log.info(f"activate_egpu: nvidia-smi rc={rc} gpu={gpu_name}")
+            else:
+                # AMD: amdgpu autoloads on rescan. Just wait and read the bus.
+                log.info("activate_egpu: AMD path — amdgpu autoloads on rescan")
+                rc_lspci, lspci_out = _run("lspci -nn | awk '/VGA|3D/ && /1002:/ && !/09:00.0/{print; exit}'")
+                gpu_name = lspci_out.strip()
+                log.info(f"activate_egpu: lspci AMD rc={rc_lspci} gpu={gpu_name}")
 
             if gpu_name:
                 return {"result": "ok", "gpu_name": gpu_name}
@@ -492,20 +650,38 @@ class Plugin:
             rc_sudo, _ = _run("echo ok", timeout=5)
             if rc_sudo != 0:
                 return {"result": "error", "error": "needs_password"}
-            log.info("deactivate_egpu: starting")
+            vendor = _read_vendor()
+            log.info(f"deactivate_egpu: starting vendor={vendor}")
 
-            # 1. PCIe remove nvidia devices (must happen before module unload)
-            removed = _pcie_remove_nvidia()
-            log.info(f"deactivate_egpu: PCIe removed {removed} devices")
+            if vendor == "nvidia":
+                # 1. PCIe remove nvidia devices (must happen before module unload)
+                removed = _pcie_remove_nvidia()
+                log.info(f"deactivate_egpu: PCIe removed {removed} devices")
 
-            # 2. Unload nvidia kernel modules
-            _unload_nvidia()
+                # 2. Unload nvidia kernel modules
+                _unload_nvidia()
 
-            # 3. Check if modules actually unloaded
-            rc_mod, _ = _run("lsmod | grep '^nvidia '")
-            modules_left = rc_mod == 0
+                # 3. Check if modules actually unloaded
+                rc_mod, _ = _run("lsmod | grep '^nvidia '")
+                modules_left = rc_mod == 0
+            else:
+                # AMD: PCIe-remove the AMD GPU on the dock (skip iGPU at 09:00.0).
+                # amdgpu typically releases cleanly without needing modprobe -r.
+                import glob as g
+                removed = 0
+                for vp in g.glob("/sys/bus/pci/devices/*/vendor"):
+                    if _read(vp) != PCI_VENDOR_AMD:
+                        continue
+                    bdf = os.path.basename(os.path.dirname(vp))
+                    if bdf.startswith("0000:09:"):
+                        continue  # iGPU
+                    log.info(f"deactivate_egpu: AMD PCIe remove {bdf}")
+                    _run(f"echo 1 > /sys/bus/pci/devices/{bdf}/remove")
+                    removed += 1
+                log.info(f"deactivate_egpu: AMD PCIe removed {removed} dock GPUs")
+                modules_left = False
 
-            # 4. ACPI disable
+            # ACPI disable (universal)
             rc, out = _run("echo 0 > /sys/devices/platform/asus-nb-wmi/egpu_enable")
             if rc != 0:
                 log.warning(f"deactivate_egpu: ACPI disable rc={rc} (may be OK)")
@@ -533,7 +709,8 @@ class Plugin:
     def _uninstall_nvidia_sync(self):
         global _operation
         _operation = "uninstalling"
-        log.info("uninstall: starting _uninstall_nvidia_sync")
+        vendor = _read_vendor()
+        log.info(f"uninstall: starting vendor={vendor}")
         try:
             # 1. Unlock filesystem — if this fails, everything else will too
             rc, out = _run("steamos-readonly disable")
@@ -542,50 +719,61 @@ class Plugin:
                 log.error("uninstall: CANNOT disable readonly — aborting")
                 return {"success": False, "error": f"Cannot unlock filesystem: {out[:200]}"}
 
-            # 2. Unload nvidia modules
-            log.info("uninstall: unloading nvidia modules")
-            _unload_nvidia()
+            if vendor == "nvidia":
+                # 2. Unload nvidia modules
+                log.info("uninstall: unloading nvidia modules")
+                _unload_nvidia()
 
-            # 3. DKMS remove
-            rc, out = _run("dkms remove nvidia --all 2>/dev/null")
-            log.info(f"uninstall: dkms remove rc={rc}")
+                # 3. DKMS remove
+                rc, out = _run("dkms remove nvidia --all 2>/dev/null")
+                log.info(f"uninstall: dkms remove rc={rc}")
 
-            # 4. Remove all nvidia packages in one pacman call to resolve deps
-            pkgs_to_remove = []
-            for pkg in ["nvidia-dkms", "opencl-nvidia", "nvidia-utils", "lib32-nvidia-utils"]:
-                rc_q, _ = _run_user(f"pacman -Q {pkg} 2>/dev/null")
-                if rc_q == 0:
-                    pkgs_to_remove.append(pkg)
+                # 4. Remove all nvidia packages in one pacman call to resolve deps
+                pkgs_to_remove = []
+                for pkg in ["nvidia-dkms", "opencl-nvidia", "nvidia-utils", "lib32-nvidia-utils"]:
+                    rc_q, _ = _run_user(f"pacman -Q {pkg} 2>/dev/null")
+                    if rc_q == 0:
+                        pkgs_to_remove.append(pkg)
+                    else:
+                        log.info(f"uninstall: skip {pkg} — not installed")
+
+                if pkgs_to_remove:
+                    pkg_list = " ".join(pkgs_to_remove)
+                    rc_rm, out_rm = _run(f"pacman -Rn --noconfirm {pkg_list}")
+                    log.info(f"uninstall: remove [{pkg_list}] rc={rc_rm} out={out_rm[:500]}")
+                    if rc_rm != 0:
+                        log.error(f"uninstall: pacman remove failed: {out_rm[:300]}")
                 else:
-                    log.info(f"uninstall: skip {pkg} — not installed")
+                    log.info("uninstall: no nvidia packages to remove")
 
-            if pkgs_to_remove:
-                pkg_list = " ".join(pkgs_to_remove)
-                rc_rm, out_rm = _run(f"pacman -Rn --noconfirm {pkg_list}")
-                log.info(f"uninstall: remove [{pkg_list}] rc={rc_rm} out={out_rm[:500]}")
-                if rc_rm != 0:
-                    log.error(f"uninstall: pacman remove failed: {out_rm[:300]}")
+                # 5. Remove orphaned DKMS kernel modules (dkms remove doesn't always clean .ko files)
+                _run("rm -f /lib/modules/*/updates/dkms/nvidia*.ko*")
+                _run("rm -rf /var/lib/dkms/nvidia/")
+                _run("depmod -a")
+                log.info("uninstall: orphaned DKMS modules cleaned")
+
+                # 6. Clean up nvidia config files + nvidia-utils EGL/udev artifacts
+                _run("rm -f /etc/modprobe.d/blacklist-nouveau.conf /etc/modprobe.d/nvidia.conf "
+                     "/etc/modprobe.d/blacklist-nvidia-drm.conf")
+                _run("rm -f /etc/modules-load.d/nvidia.conf")
+                _run("rm -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json "
+                     "/usr/lib/udev/rules.d/60-nvidia.rules /usr/lib/modprobe.d/nvidia-sleep.conf")
+                log.info("uninstall: nvidia config files removed")
             else:
-                log.info("uninstall: no nvidia packages to remove")
+                # AMD: nothing kernel-side to remove; amdgpu stays in the kernel.
+                # Just PCIe-remove the dock GPU so it's clean before service teardown.
+                log.info("uninstall: AMD path — no DKMS / pacman work")
+                import glob as g
+                for vp in g.glob("/sys/bus/pci/devices/*/vendor"):
+                    if _read(vp) != PCI_VENDOR_AMD:
+                        continue
+                    bdf = os.path.basename(os.path.dirname(vp))
+                    if not bdf.startswith("0000:09:"):
+                        _run(f"echo 1 > /sys/bus/pci/devices/{bdf}/remove")
 
-            # 5. Remove orphaned DKMS kernel modules (dkms remove doesn't always clean .ko files)
-            _run("rm -f /lib/modules/*/updates/dkms/nvidia*.ko*")
-            _run("rm -rf /var/lib/dkms/nvidia/")
-            _run("depmod -a")
-            log.info("uninstall: orphaned DKMS modules cleaned")
-
-            # 6. Clean up config files + nvidia-utils EGL/udev artifacts
-            _run("rm -f /etc/modprobe.d/blacklist-nouveau.conf /etc/modprobe.d/nvidia.conf "
-                 "/etc/modprobe.d/blacklist-nvidia-drm.conf")
-            _run("rm -f /etc/modules-load.d/nvidia.conf")
-            _run("rm -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json "
-                 "/usr/lib/udev/rules.d/60-nvidia.rules /usr/lib/modprobe.d/nvidia-sleep.conf")
-            log.info("uninstall: config files removed")
-
-            # 7. Disable and remove services (auto + shutdown).
+            # 7. Disable and remove services (auto + shutdown) — universal.
             # Also clean up legacy /usr/local/bin/gamescope wrapper from earlier
-            # plugin versions and its config dir, so a stale wrapper can't
-            # shadow /usr/bin/gamescope after uninstall.
+            # plugin versions and its config dir.
             _run("systemctl disable xg-mobile-auto.service xg-mobile-shutdown.service 2>/dev/null")
             _run("rm -f /usr/local/bin/xgm-auto /usr/local/bin/xgm /usr/local/bin/xgm-shutdown "
                  "/usr/local/bin/gamescope "
@@ -594,13 +782,14 @@ class Plugin:
             _run_user("rm -rf /home/deck/.config/xgm")
             log.info("uninstall: service cleanup done")
 
-            # 8. Verify removal — check module is gone
-            rc, _ = _run("modinfo nvidia 2>/dev/null")
-            if rc == 0:
-                log.error("uninstall: FAILED — nvidia module still present")
-                return {"success": False, "error": "nvidia module still present after uninstall"}
+            # 8. Verify removal — vendor-specific
+            if vendor == "nvidia":
+                rc, _ = _run("modinfo nvidia 2>/dev/null")
+                if rc == 0:
+                    log.error("uninstall: FAILED — nvidia module still present")
+                    return {"success": False, "error": "nvidia module still present after uninstall"}
 
-            log.info("uninstall: SUCCESS — nvidia module removed")
+            log.info(f"uninstall: SUCCESS — vendor={vendor} cleanup complete")
             return {"success": True}
         except Exception as e:
             log.error(f"uninstall EXCEPTION: {e}\n{traceback.format_exc()}")
@@ -610,7 +799,55 @@ class Plugin:
             _install_cleanup()
 
     async def get_launch_options(self):
+        vendor = _read_vendor()
+        if vendor == "amd":
+            # DRI_PRIME=1 picks the discrete (dock) AMD GPU when both iGPU
+            # and dGPU are visible. RADV is the default Mesa Vulkan driver
+            # on SteamOS, so no extra flags needed for Vulkan/DXVK.
+            return 'DRI_PRIME=1 %command%'
         return 'DXVK_FILTER_DEVICE_NAME="RTX 4090" PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 %command%'
+
+    async def get_diagnostics(self):
+        """Collect a single dump of state useful for bug reports. Returned
+        as a string, intended for clipboard copy from the UI.
+
+        Includes: vendor file, kernel version, asus-wmi sysfs, PCI vendors
+        on bus, lsmod (nvidia/amdgpu lines), recent backend.log tail, and
+        recent xg-mobile-auto.service journal lines."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._get_diagnostics_sync)
+
+    def _get_diagnostics_sync(self):
+        sections = []
+
+        def section(title, cmd, timeout=10):
+            rc, out = _run_user(cmd, timeout=timeout)
+            sections.append(f"=== {title} ===\n{out.strip()[:2000]}")
+
+        sections.append(f"=== xgm vendor ===\n{_read_vendor()}")
+        section("uname -a", "uname -a")
+        section("os-release", "cat /etc/os-release | grep -E 'VERSION|BUILD|NAME'")
+        section("asus-wmi sysfs",
+                "for f in /sys/devices/platform/asus-nb-wmi/{egpu_connected,egpu_enable,dgpu_disable}; "
+                "do echo \"$f = $(cat $f 2>/dev/null)\"; done")
+        section("PCI VGA/3D devices",
+                "lspci -nn | grep -iE 'VGA|3D|Display'")
+        section("PCI link state of dock GPU",
+                "for d in /sys/bus/pci/devices/0000:01:*/vendor; do bdf=$(basename $(dirname $d)); "
+                "echo \"--- $bdf ---\"; sudo lspci -vv -s $bdf 2>/dev/null | grep -E 'LnkSta:|LnkCap:|LnkCtl2:'; done")
+        section("loaded GPU modules",
+                "lsmod | grep -iE 'nvidia|amdgpu|radeon|nouveau' | head -20")
+        section("xg-mobile-auto.service status",
+                "systemctl status xg-mobile-auto.service --no-pager 2>&1 | head -20")
+        section("xg-mobile-auto journal (this boot)",
+                "journalctl -u xg-mobile-auto.service -b --no-pager 2>&1 | tail -40")
+        section("plugin scripts/units present",
+                "ls -la /usr/local/bin/xgm-* /etc/systemd/system/xg-mobile-* 2>&1")
+        section("modprobe configs",
+                "ls /etc/modprobe.d/ /etc/modules-load.d/ 2>&1")
+        section("backend.log tail",
+                f"tail -80 {os.path.join(LOG_DIR, 'backend.log')} 2>&1")
+        return "\n\n".join(sections)
 
     async def _main(self):
         pass

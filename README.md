@@ -94,7 +94,9 @@ ssh deck@<ally-ip> "git clone https://github.com/stensmir/xg-mobile-linux.git /t
   sudo systemctl restart plugin_loader.service"
 ```
 
-**On the Ally:** open QAM → Decky → XG Mobile → **Setup** (enter sudo password once) → **Install nvidia driver**. Reboot when prompted.
+**On the Ally:** open QAM → Decky → XG Mobile → **Setup** (enter sudo password once) → choose your dock:
+- **Install for NVIDIA dock** (GC31R/S, GC33Y, GC33Z, USB-C 5090) — builds nvidia-dkms, ~15 minutes. Reboot when prompted.
+- **Install for AMD dock (GC32L)** — short install: just auto-detect + safe-shutdown services. amdgpu is already in the SteamOS kernel. **Experimental** — confirmed only at the activation level; if anything breaks, hit "Copy diagnostics" in QAM and open an issue.
 
 After reboot the dock auto-detect service loads nvidia only when the dock is connected, so the Ally is safe to boot standalone (AMD iGPU only).
 

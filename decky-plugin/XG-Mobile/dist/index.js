@@ -21,6 +21,8 @@ const toaster = api.toaster;
 // ── Backend calls ──────────────────────────────────────
 const getStatus = callable("get_status");
 const installNvidia = callable("install_nvidia");
+const installAmd = callable("install_amd");
+const getDiagnostics = callable("get_diagnostics");
 const getProgress = callable("get_progress");
 const activate = callable("activate_egpu");
 const deactivate = callable("deactivate_egpu");
@@ -296,10 +298,12 @@ const XGMobilePanel = () => {
         gpu_mem: "",
         gpu_mem_total: "",
         gpu_power: "",
+        vendor: "nvidia",
         nvidia_installed: false,
         nvidia_working: false,
         error: undefined,
     });
+    const [diagsCopied, setDiagsCopied] = SP_REACT.useState(false);
     const [error, setError] = SP_REACT.useState(null);
     const [copied, setCopied] = SP_REACT.useState(false);
     // Guard: when true, polling won't reset phase (waiting for sudo modal)
@@ -491,6 +495,70 @@ const XGMobilePanel = () => {
     const handleInstall = async () => {
         setError(null);
         await executeInstall();
+    };
+    const executeInstallAmd = async () => {
+        setPhase({ status: "installing", step: 0, total: 3, msg: "Starting AMD install..." });
+        try {
+            let result = await installAmd();
+            if (result.error === "needs_password") {
+                const ok = await doSudoSetup("install");
+                if (!ok) {
+                    setPhase(prev => transition(prev, { type: "done" }));
+                    return;
+                }
+                result = await installAmd();
+            }
+            if (result.error) {
+                setError(result.error);
+                if (result.failed_step) {
+                    setPhase(prev => transition(prev, { type: "install_error", error: true, failedStep: result.failed_step }));
+                    await new Promise((r) => setTimeout(r, 5000));
+                }
+            }
+            else if (result.success) {
+                xgToast(`AMD support installed. ${result.gpu || ""}`);
+            }
+        }
+        catch (e) {
+            handleError(e, "AMD install failed");
+        }
+        finally {
+            setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+            await refresh();
+        }
+    };
+    const handleInstallAmd = async () => {
+        setError(null);
+        await executeInstallAmd();
+    };
+    const copyDiagnostics = async () => {
+        try {
+            const dump = await getDiagnostics();
+            try {
+                if (navigator.clipboard) {
+                    await navigator.clipboard.writeText(dump);
+                }
+                else {
+                    throw new Error("no clipboard API");
+                }
+            }
+            catch {
+                const ta = document.createElement("textarea");
+                ta.value = dump;
+                ta.style.position = "fixed";
+                ta.style.opacity = "0";
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+            }
+            setDiagsCopied(true);
+            toaster.toast({ title: "Diagnostics copied", body: `${dump.length} chars — paste into a GitHub issue` });
+            setTimeout(() => setDiagsCopied(false), 3000);
+        }
+        catch (e) {
+            handleError(e, "Diagnostics copy failed");
+        }
     };
     const handleToggle = async (enable) => {
         setPhase({ status: enable ? "activating" : "deactivating" });
@@ -777,7 +845,7 @@ const XGMobilePanel = () => {
                     : fmtMem(status.gpu_mem),
                 label: "VRAM",
             }))))), 
-    // Install section (idle, connected, no nvidia)
+    // Install section (idle, connected, no driver yet) — two paths
     isIdle &&
         status.connected &&
         !status.nvidia_installed &&
@@ -788,7 +856,7 @@ const XGMobilePanel = () => {
                 marginBottom: "10px",
                 lineHeight: "1.4",
             },
-        }, "Install nvidia driver + auto-detection service. Takes ~15 minutes."), SP_REACT.createElement(ActionButton, { onClick: handleInstall, variant: "primary" }, "⚡ Install nvidia driver")))), 
+        }, "Choose the path for your XG Mobile dock. NVIDIA path builds nvidia-dkms (~15 min). AMD path is much shorter — amdgpu is already in the SteamOS kernel."), SP_REACT.createElement("div", { style: { marginBottom: "8px" } }, SP_REACT.createElement(ActionButton, { onClick: handleInstall, variant: "primary" }, "⚡ Install for NVIDIA dock")), SP_REACT.createElement(ActionButton, { onClick: handleInstallAmd, variant: "ghost" }, "Install for AMD dock (GC32L)")))), 
     // Games + Uninstall (idle, nvidia installed)
     isIdle &&
         status.nvidia_installed &&
@@ -804,7 +872,9 @@ const XGMobilePanel = () => {
                 wordBreak: "break-all",
                 lineHeight: "1.4",
             },
-        }, 'DXVK_FILTER_DEVICE_NAME="RTX 4090" PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 %command%'), SP_REACT.createElement(ActionButton, { onClick: copyLaunchOptions, variant: "ghost" }, copied ? "✓ Copied" : "Copy to clipboard"))), SP_REACT.createElement(DFL.PanelSectionRow, null, SP_REACT.createElement("div", { style: { marginTop: "8px" } }, SP_REACT.createElement(ActionButton, { onClick: handleUninstall, variant: "danger" }, "Uninstall driver")))));
+        }, status.vendor === "amd"
+            ? 'DRI_PRIME=1 %command%'
+            : 'DXVK_FILTER_DEVICE_NAME="RTX 4090" PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 %command%'), SP_REACT.createElement(ActionButton, { onClick: copyLaunchOptions, variant: "ghost" }, copied ? "✓ Copied" : "Copy to clipboard"))), SP_REACT.createElement(DFL.PanelSectionRow, null, SP_REACT.createElement("div", { style: { marginTop: "8px", display: "flex", flexDirection: "column", gap: "8px" } }, SP_REACT.createElement(ActionButton, { onClick: copyDiagnostics, variant: "ghost" }, diagsCopied ? "✓ Diagnostics copied" : "Copy diagnostics"), SP_REACT.createElement(ActionButton, { onClick: handleUninstall, variant: "danger" }, "Uninstall driver")))));
 };
 // ── Plugin definition ──────────────────────────────────
 var index = DFL.definePlugin(() => ({

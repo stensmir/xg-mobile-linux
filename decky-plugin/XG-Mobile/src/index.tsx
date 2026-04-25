@@ -35,6 +35,16 @@ const installNvidia = callable<[], {
   failed_step?: number;
 }>("install_nvidia");
 
+const installAmd = callable<[], {
+  success: boolean;
+  vendor?: string;
+  gpu?: string;
+  error?: string;
+  failed_step?: number;
+}>("install_amd");
+
+const getDiagnostics = callable<[], string>("get_diagnostics");
+
 const getProgress = callable<[], {
   step: number;
   total: number;
@@ -456,10 +466,12 @@ const XGMobilePanel: FC = () => {
     gpu_mem: "",
     gpu_mem_total: "",
     gpu_power: "",
+    vendor: "nvidia",
     nvidia_installed: false,
     nvidia_working: false,
     error: undefined as string | undefined,
   });
+  const [diagsCopied, setDiagsCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   // Guard: when true, polling won't reset phase (waiting for sudo modal)
@@ -656,6 +668,65 @@ const XGMobilePanel: FC = () => {
   const handleInstall = async () => {
     setError(null);
     await executeInstall();
+  };
+
+  const executeInstallAmd = async () => {
+    setPhase({ status: "installing", step: 0, total: 3, msg: "Starting AMD install..." });
+    try {
+      let result = await installAmd();
+      if (result.error === "needs_password") {
+        const ok = await doSudoSetup("install");
+        if (!ok) {
+          setPhase(prev => transition(prev, { type: "done" }));
+          return;
+        }
+        result = await installAmd();
+      }
+      if (result.error) {
+        setError(result.error);
+        if (result.failed_step) {
+          setPhase(prev => transition(prev, { type: "install_error", error: true, failedStep: result.failed_step }));
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      } else if (result.success) {
+        xgToast(`AMD support installed. ${result.gpu || ""}`);
+      }
+    } catch (e: any) {
+      handleError(e, "AMD install failed");
+    } finally {
+      setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+      await refresh();
+    }
+  };
+
+  const handleInstallAmd = async () => {
+    setError(null);
+    await executeInstallAmd();
+  };
+
+  const copyDiagnostics = async () => {
+    try {
+      const dump = await getDiagnostics();
+      try {
+        if (navigator.clipboard) {
+          await navigator.clipboard.writeText(dump);
+        } else { throw new Error("no clipboard API"); }
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = dump;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setDiagsCopied(true);
+      toaster.toast({ title: "Diagnostics copied", body: `${dump.length} chars — paste into a GitHub issue` });
+      setTimeout(() => setDiagsCopied(false), 3000);
+    } catch (e: any) {
+      handleError(e, "Diagnostics copy failed");
+    }
   };
 
   const handleToggle = async (enable: boolean) => {
@@ -1074,7 +1145,7 @@ const XGMobilePanel: FC = () => {
         )
       ),
 
-    // Install section (idle, connected, no nvidia)
+    // Install section (idle, connected, no driver yet) — two paths
     isIdle &&
       status.connected &&
       !status.nvidia_installed &&
@@ -1097,12 +1168,21 @@ const XGMobilePanel: FC = () => {
                   lineHeight: "1.4",
                 },
               },
-              "Install nvidia driver + auto-detection service. Takes ~15 minutes."
+              "Choose the path for your XG Mobile dock. NVIDIA path builds nvidia-dkms (~15 min). AMD path is much shorter — amdgpu is already in the SteamOS kernel."
+            ),
+            createElement(
+              "div",
+              { style: { marginBottom: "8px" } },
+              createElement(
+                ActionButton,
+                { onClick: handleInstall, variant: "primary" },
+                "⚡ Install for NVIDIA dock"
+              )
             ),
             createElement(
               ActionButton,
-              { onClick: handleInstall, variant: "primary" },
-              "⚡ Install nvidia driver"
+              { onClick: handleInstallAmd, variant: "ghost" },
+              "Install for AMD dock (GC32L)"
             )
           )
         )
@@ -1140,7 +1220,9 @@ const XGMobilePanel: FC = () => {
                   lineHeight: "1.4",
                 },
               },
-              'DXVK_FILTER_DEVICE_NAME="RTX 4090" PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 %command%'
+              status.vendor === "amd"
+                ? 'DRI_PRIME=1 %command%'
+                : 'DXVK_FILTER_DEVICE_NAME="RTX 4090" PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 %command%'
             ),
             createElement(
               ActionButton,
@@ -1154,7 +1236,12 @@ const XGMobilePanel: FC = () => {
           null,
           createElement(
             "div",
-            { style: { marginTop: "8px" } },
+            { style: { marginTop: "8px", display: "flex", flexDirection: "column" as const, gap: "8px" } },
+            createElement(
+              ActionButton,
+              { onClick: copyDiagnostics, variant: "ghost" },
+              diagsCopied ? "✓ Diagnostics copied" : "Copy diagnostics"
+            ),
             createElement(
               ActionButton,
               { onClick: handleUninstall, variant: "danger" },
