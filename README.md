@@ -63,7 +63,7 @@ More screenshots:
 
 ## How it works
 
-The XG Mobile connector is **PCIe x8 behind a software lock**. On Windows ASUS Armoury Crate runs a handshake to release power and bus. On Linux nothing of the sort is needed — the SteamOS kernel already ships `asus-wmi` with `egpu_enable`, so the entire activation sequence is just:
+The XG Mobile connector is **PCIe behind a software lock**. On the ROG Ally Z1 Extreme it negotiates as **PCIe 3.0 x4** (verified via `lspci -vv` — `LnkCtl2 Target Link Speed: 8GT/s`, `LnkSta Width: x4`). The marketed "PCIe 4.0 x8" describes the connector itself; on Ally the APU only has 4 free Gen3 lanes for the dock. ROG Flow X13/X16 likely negotiate wider — would appreciate `lspci` output from those if you have one. On Windows ASUS Armoury Crate runs a handshake to release power and bus. On Linux nothing of the sort is needed — the SteamOS kernel already ships `asus-wmi` with `egpu_enable`, so the entire activation sequence is just:
 
 ```bash
 echo 1 > /sys/devices/platform/asus-nb-wmi/egpu_enable   # ACPI: power + PCIe up
