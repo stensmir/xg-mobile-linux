@@ -77,6 +77,19 @@ That's the whole "driver". The plugin automates installation, activation, and sa
 
 ## Install
 
+### Quick install via Decky URL (easiest)
+
+If you have **Decky Loader's developer mode** enabled (Settings → General → Developer mode), this is a one-click flow:
+
+1. Decky → Settings → **Custom URL** (under Developer)
+2. Paste:
+   ```
+   https://github.com/stensmir/xg-mobile-linux/releases/latest/download/XG-Mobile.tar.gz
+   ```
+3. Decky downloads, unpacks, and restarts the plugin loader. Open QAM → XG Mobile → **Setup**.
+
+No SSH, no git, no terminal. Works for both NVIDIA and AMD docks (the install path is chosen in Setup).
+
 ### Via Decky Loader (recommended)
 
 **Prerequisites:**

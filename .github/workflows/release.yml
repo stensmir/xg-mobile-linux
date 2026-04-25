@@ -1,0 +1,63 @@
+name: Release plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install plugin frontend deps
+        working-directory: decky-plugin/XG-Mobile
+        run: npm install
+
+      - name: Build dist
+        working-directory: decky-plugin/XG-Mobile
+        run: npm run build
+
+      - name: Package plugin tarball
+        run: |
+          # Decky expects: tarball whose top-level entry is the plugin folder
+          # (XG-Mobile/), containing plugin.json, main.py, dist/, scripts/, systemd/.
+          # node_modules are NOT shipped — backend runs main.py directly,
+          # the built dist/index.js is what the frontend loads.
+          cd decky-plugin
+          tar --exclude='XG-Mobile/node_modules' \
+              --exclude='XG-Mobile/src' \
+              --exclude='XG-Mobile/rollup.config.js' \
+              --exclude='XG-Mobile/tsconfig.json' \
+              --exclude='XG-Mobile/package-lock.json' \
+              -czf ../XG-Mobile.tar.gz XG-Mobile
+          cd ..
+          ls -la XG-Mobile.tar.gz
+          echo "--- contents ---"
+          tar -tzf XG-Mobile.tar.gz | head -30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: XG-Mobile.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
