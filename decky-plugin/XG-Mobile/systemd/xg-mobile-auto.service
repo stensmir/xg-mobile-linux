@@ -1,0 +1,13 @@
+[Unit]
+Description=XG Mobile eGPU Auto-Detection
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xgm-auto
+RemainAfterExit=yes
+ExecStop=/usr/local/bin/xgm-auto stop
+
+[Install]
+WantedBy=multi-user.target

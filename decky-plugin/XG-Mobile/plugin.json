@@ -1,0 +1,10 @@
+{
+  "name": "XG Mobile",
+  "author": "NSFox",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["egpu", "xg-mobile", "nvidia", "rog-ally"],
+    "description": "Control ASUS XG Mobile eGPU — activate/deactivate RTX 4090, copy launch options, monitor status."
+  }
+}

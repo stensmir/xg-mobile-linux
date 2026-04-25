@@ -1,0 +1,11 @@
+[Unit]
+Description=XG Mobile eGPU Safe Shutdown
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xgm-shutdown
+
+[Install]
+WantedBy=shutdown.target reboot.target halt.target

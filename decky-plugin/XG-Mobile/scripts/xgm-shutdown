@@ -1,0 +1,36 @@
+#!/bin/bash
+# xgm-shutdown — Safe eGPU teardown on reboot/shutdown.
+# PCIe remove → modprobe -r → ACPI disable.
+
+SYSFS_ENABLE="/sys/devices/platform/asus-nb-wmi/egpu_enable"
+LOGFILE="/var/log/xgm-shutdown.log"
+
+log() { echo "$(date '+%F %T') xgm-shutdown: $*" | tee -a "$LOGFILE"; }
+
+# Step 1: Find and remove all nvidia PCIe devices
+for dev in /sys/bus/pci/devices/*; do
+    vendor=$(cat "$dev/vendor" 2>/dev/null)
+    if [ "$vendor" = "0x10de" ]; then
+        bdf=$(basename "$dev")
+        log "Removing PCIe device $bdf"
+        echo 1 > "$dev/remove" 2>/dev/null
+    fi
+done
+
+# Step 2: Try unloading nvidia modules (may now succeed after PCIe remove)
+if lsmod | grep -q "^nvidia"; then
+    modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null
+    if lsmod | grep -q "^nvidia"; then
+        log "WARN: nvidia modules still loaded (non-critical, PCIe device already removed)"
+    else
+        log "nvidia modules unloaded"
+    fi
+fi
+
+# Step 3: ACPI disable — cut power to the dock
+if [ -f "$SYSFS_ENABLE" ]; then
+    echo 0 > "$SYSFS_ENABLE" 2>/dev/null
+    log "egpu_enable = 0 (dock powered off)"
+fi
+
+log "Shutdown cleanup complete"

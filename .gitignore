@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Decky plugin build
+node_modules/
+package-lock.json
+*.map
+
+# Local artefacts (not for commit)
+dumps/
+*.dat
+*.dsl
+reddit-post.md
