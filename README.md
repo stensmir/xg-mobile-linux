@@ -218,4 +218,4 @@ Scripts and systemd units live **inside** the plugin so installation works offli
 
 ## License
 
-MIT — do whatever. No warranty.
+Released under the MIT License. See [LICENSE](LICENSE) for the full text.
