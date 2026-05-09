@@ -2,8 +2,8 @@
 
 > RTX 4090 on a ROG Ally running SteamOS — one-click install via Decky Loader.
 
-[![SteamOS 3.8](https://img.shields.io/badge/SteamOS-3.8.2_beta-1A9FFF)](https://store.steampowered.com/steamos)
-[![Kernel 6.16](https://img.shields.io/badge/kernel-6.16.12--valve15-orange)](https://gitlab.steamos.cloud/jupiter/linux-integration)
+[![SteamOS 3.8](https://img.shields.io/badge/SteamOS-3.8.4_beta-1A9FFF)](https://store.steampowered.com/steamos)
+[![Kernel 6.16](https://img.shields.io/badge/kernel-6.16.12--valve18-orange)](https://gitlab.steamos.cloud/jupiter/linux-integration)
 [![NVIDIA 575](https://img.shields.io/badge/nvidia--dkms-575.64.05-76B900)](https://www.nvidia.com/Download/index.aspx)
 [![CUDA 12.9](https://img.shields.io/badge/CUDA-12.9-76B900)](https://developer.nvidia.com/cuda-downloads)
 [![License MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
