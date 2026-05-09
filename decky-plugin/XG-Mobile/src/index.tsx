@@ -473,6 +473,9 @@ const XGMobilePanel: FC = () => {
   });
   const [diagsCopied, setDiagsCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Informational notice (not error) — used when an operation completes
+  // partially and the user needs guidance, e.g. "reboot to detach the dock".
+  const [notice, setNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   // Guard: when true, polling won't reset phase (waiting for sudo modal)
   const pendingSudo = useRef(false);
@@ -622,8 +625,15 @@ const XGMobilePanel: FC = () => {
   // ── Install logic ─────────────────────────────────────
   const executeInstall = async () => {
     setPhase(prev => transition(prev, { type: "install_click" }));
+    // attached=true means a backend install was already running — polling
+    // will follow live progress, so we must NOT reset phase in finally.
+    let attached = false;
     try {
       const result = await installNvidia();
+      if (result.error === "already_running") {
+        attached = true;
+        return;
+      }
       if (result.error === "needs_password") {
         // Stay in installing phase — modal overlays it
         const ok = await doSudoSetup("install");
@@ -631,8 +641,19 @@ const XGMobilePanel: FC = () => {
           setPhase(prev => transition(prev, { type: "done" }));
           return;
         }
+        // Re-mute polling briefly: doSudoSetup just released pendingSudo,
+        // but the upcoming retry needs time to reach _operation="installing"
+        // inside install_nvidia. Without this, a polling tick can land in
+        // that gap, see operation=null, and bounce phase to idle — making
+        // the timeline disappear and forcing the user to click Install again.
+        pendingSudo.current = true;
+        setTimeout(() => { pendingSudo.current = false; }, 3000);
         // Already in installing phase, just retry
         const retry = await installNvidia();
+        if (retry.error === "already_running") {
+          attached = true;
+          return;
+        }
         if (retry.error) {
           setError(retry.error);
           if (retry.failed_step) {
@@ -660,7 +681,9 @@ const XGMobilePanel: FC = () => {
     } catch (e: any) {
       handleError(e, "Install failed");
     } finally {
-      setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+      if (!attached) {
+        setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+      }
       await refresh();
     }
   };
@@ -672,15 +695,29 @@ const XGMobilePanel: FC = () => {
 
   const executeInstallAmd = async () => {
     setPhase({ status: "installing", step: 0, total: 3, msg: "Starting AMD install..." });
+    let attached = false;
     try {
       let result = await installAmd();
+      if (result.error === "already_running") {
+        attached = true;
+        return;
+      }
       if (result.error === "needs_password") {
         const ok = await doSudoSetup("install");
         if (!ok) {
           setPhase(prev => transition(prev, { type: "done" }));
           return;
         }
+        // Re-mute polling briefly — same race as nvidia path: backend hasn't
+        // reached _operation="installing" yet on the retry call, and a polling
+        // tick in that gap would bounce the phase to idle.
+        pendingSudo.current = true;
+        setTimeout(() => { pendingSudo.current = false; }, 3000);
         result = await installAmd();
+        if (result.error === "already_running") {
+          attached = true;
+          return;
+        }
       }
       if (result.error) {
         setError(result.error);
@@ -694,7 +731,9 @@ const XGMobilePanel: FC = () => {
     } catch (e: any) {
       handleError(e, "AMD install failed");
     } finally {
-      setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+      if (!attached) {
+        setPhase(prev => prev.status === "installing" ? transition(prev, { type: "done" }) : prev);
+      }
       await refresh();
     }
   };
@@ -732,6 +771,7 @@ const XGMobilePanel: FC = () => {
   const handleToggle = async (enable: boolean) => {
     setPhase({ status: enable ? "activating" : "deactivating" });
     setError(null);
+    setNotice(null);
     try {
       if (enable) {
         let result = await activate();
@@ -753,7 +793,11 @@ const XGMobilePanel: FC = () => {
           result = await deactivate();
         }
         if (result.result === "partial") {
-          xgToast("eGPU deactivated. Reboot recommended.");
+          // Not an error — informational. Compositor is holding the
+          // driver, so we couldn't fully detach. Show as amber notice,
+          // not red error.
+          setNotice(result.error || "Restart Steam Deck to safely unplug the dock — runtime detach isn't supported on SteamOS.");
+          xgToast("Reboot to detach");
         } else if (result.error) {
           setError(result.error);
         } else {
@@ -916,6 +960,69 @@ const XGMobilePanel: FC = () => {
         )
       ),
 
+    // Informational notice — amber, not red. For "reboot to detach"-style
+    // guidance where nothing went wrong but the user needs a next step.
+    notice &&
+      createElement(
+        PanelSection,
+        null,
+        createElement(
+          PanelSectionRow,
+          null,
+          createElement(
+            Card,
+            { accent: C.amber },
+            createElement(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "flex-start",
+                },
+              },
+              createElement(
+                "div",
+                { style: { flex: 1 } },
+                createElement(
+                  "div",
+                  { style: { ...sectionHeaderStyle, color: C.amber, marginBottom: "4px" } },
+                  "Reboot to detach"
+                ),
+                createElement(
+                  "div",
+                  {
+                    style: {
+                      fontSize: "12px",
+                      color: C.textSecondary,
+                      lineHeight: "1.4",
+                      wordBreak: "break-word" as const,
+                    },
+                  },
+                  notice
+                )
+              ),
+              createElement(
+                "button",
+                {
+                  onClick: () => setNotice(null),
+                  style: {
+                    background: "none",
+                    border: "none",
+                    color: C.textSecondary,
+                    fontSize: "16px",
+                    cursor: "pointer",
+                    padding: "0 0 0 8px",
+                    lineHeight: 1,
+                  },
+                },
+                "×"
+              )
+            )
+          )
+        )
+      ),
+
     // Phase: loading
     phase.status === "loading" &&
       createElement(
@@ -977,14 +1084,38 @@ const XGMobilePanel: FC = () => {
         createElement(PanelSectionRow, null, createElement(MiniSpinner, { label: "Removing driver..." }))
       ),
 
-    // Phases: idle / activating / deactivating - toggle first, then status
-    (isIdle || isTransitioning) &&
+    // Phase: activating / deactivating — explicit progress card.
+    // Activation can take 5–15s (ACPI, PCIe rescan, modprobe, GPU query).
+    // Without this, UI looks idle and users assume nothing is happening.
+    isTransitioning &&
+      createElement(
+        PanelSection,
+        null,
+        createElement(
+          PanelSectionRow,
+          null,
+          createElement(MiniSpinner, {
+            label: phase.status === "activating"
+              ? "Activating eGPU... (5–15s)"
+              : "Deactivating eGPU...",
+          })
+        )
+      ),
+
+    // Phases: idle - toggle first, then status
+    isIdle &&
       createElement(
         PanelSection,
         null,
 
-        // Toggle — first element for gamepad focus & scroll
+        // Toggle — first element for gamepad focus & scroll.
+        // Hidden for NVIDIA when the eGPU is already active: gamescope holds
+        // nvidia-drm via DRM refcount on a live session, so runtime detach
+        // can't unload the driver. The user has to reboot to disconnect the
+        // dock, and a non-functional toggle was just confusing. AMD path keeps
+        // the toggle since amdgpu releases cleanly on PCIe remove.
         status.connected &&
+          !(status.vendor === "nvidia" && status.enabled) &&
           createElement(
             PanelSectionRow,
             null,
@@ -1000,6 +1131,30 @@ const XGMobilePanel: FC = () => {
                 disabled: busy,
                 onChange: handleToggle,
               })
+            )
+          ),
+
+        // For NVIDIA when active: small hint that detach requires reboot,
+        // since the toggle is hidden and the user might wonder how to stop.
+        status.connected && status.vendor === "nvidia" && status.enabled &&
+          createElement(
+            PanelSectionRow,
+            null,
+            createElement(
+              Card,
+              { accent: "rgb(118, 185, 0)" },
+              createElement(
+                "div",
+                {
+                  style: {
+                    fontSize: "12px",
+                    color: C.textSecondary,
+                    lineHeight: "1.4",
+                    padding: "4px 0",
+                  },
+                },
+                "eGPU active. Reboot to safely detach the dock."
+              )
             )
           ),
 

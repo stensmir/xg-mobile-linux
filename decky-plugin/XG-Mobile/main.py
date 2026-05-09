@@ -61,7 +61,12 @@ def _run(cmd, timeout=300):
             capture_output=True, text=True, timeout=timeout, env=_ENV,
         )
         out = r.stdout.strip() + "\n" + r.stderr.strip()
-        log.debug(f"_run rc={r.returncode} out={out[:500]}")
+        # On failure log full output (no truncation) so pacman/dkms errors
+        # are diagnosable from backend.log alone.
+        if r.returncode != 0:
+            log.error(f"_run rc={r.returncode} cmd={cmd[:200]}\n--- BEGIN OUTPUT ---\n{out}\n--- END OUTPUT ---")
+        else:
+            log.debug(f"_run rc=0 out={out[:500]}")
         return r.returncode, out
     except subprocess.TimeoutExpired:
         log.error(f"_run TIMEOUT after {timeout}s: {cmd[:200]}")
@@ -101,8 +106,11 @@ def _progress(step, total, msg):
         pass
 
 def _unload_nvidia():
-    """Unload all nvidia kernel modules in dependency order."""
-    _run("modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null")
+    """Unload all nvidia kernel modules in dependency order.
+    Short timeout — if something is holding the modules (active gamescope,
+    DRM client, etc.) we'd rather report 'partial' to the UI than block
+    for 5 minutes and look frozen."""
+    _run("modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null", timeout=15)
 
 def _read_vendor():
     """Read the recorded eGPU vendor. Default: 'nvidia' for backward compat
@@ -140,7 +148,9 @@ def _scan_pci_vendor():
     return ""
 
 def _pcie_remove_nvidia():
-    """Remove all nvidia PCIe devices via sysfs."""
+    """Remove all nvidia PCIe devices via sysfs.
+    Short timeout: if the kernel can't release the device (driver still
+    bound), we'd rather move on and leave a stale node than block 5 min."""
     import glob as g
     removed = 0
     for vendor_path in g.glob("/sys/bus/pci/devices/*/vendor"):
@@ -148,7 +158,7 @@ def _pcie_remove_nvidia():
             dev_path = os.path.dirname(vendor_path)
             bdf = os.path.basename(dev_path)
             log.info(f"PCIe remove: {bdf}")
-            _run(f"echo 1 > {dev_path}/remove")
+            _run(f"echo 1 > {dev_path}/remove", timeout=10)
             removed += 1
     return removed
 
@@ -159,11 +169,19 @@ class StepError(Exception):
         self.output = output
         super().__init__(f"Step {step} failed: {msg}")
 
-def _install_cleanup():
-    """Remove passwordless sudo and re-enable readonly filesystem.
-    Both commands in one sudo session — after sudoers removal, sudo stops working."""
-    log.info("cleanup: starting (readonly enable + rm zz-deck)")
-    rc, out = _run("steamos-readonly enable 2>/dev/null; rm -f /etc/sudoers.d/zz-deck")
+def _install_cleanup(keep_sudo=False):
+    """Re-enable readonly filesystem; optionally keep passwordless sudo.
+
+    keep_sudo=True is used when install fails — leaving zz-deck in place lets
+    the user retry without re-entering the password. Successful install removes
+    zz-deck normally (security restored).
+    """
+    if keep_sudo:
+        log.info("cleanup: starting (readonly enable, KEEP zz-deck for retry)")
+        rc, out = _run("steamos-readonly enable 2>/dev/null; true")
+    else:
+        log.info("cleanup: starting (readonly enable + rm zz-deck)")
+        rc, out = _run("steamos-readonly enable 2>/dev/null; rm -f /etc/sudoers.d/zz-deck")
     log.info(f"cleanup: rc={rc} out={out[:200]}")
 
 
@@ -191,7 +209,6 @@ class Plugin:
     def _get_status_sync(self):
         try:
             connected = _read("/sys/devices/platform/asus-nb-wmi/egpu_connected") == "1"
-            enabled = _read("/sys/devices/platform/asus-nb-wmi/egpu_enable") == "1"
             vendor = _read_vendor()
 
             # Fast GPU-on-bus check via sysfs instead of slow lspci.
@@ -210,6 +227,13 @@ class Plugin:
                             gpu_on_bus = True; break
             except Exception:
                 pass
+
+            # `enabled` reflects REAL state (GPU actually on the PCIe bus),
+            # not the asus-nb-wmi ACPI flag. After a deactivate flow, AER
+            # may mark the bus broken and the WMI flag stays stuck at 1
+            # silently — UI would show "Active" while nothing is running.
+            # Trust the bus.
+            enabled = gpu_on_bus
 
             gpu_name = ""
             gpu_temp = ""
@@ -322,6 +346,7 @@ class Plugin:
     def _install_amd_sync(self):
         global _operation
         _operation = "installing"
+        install_succeeded = False
         total = 3
 
         def step(n, msg, cmd, timeout=120, critical=True):
@@ -356,7 +381,7 @@ class Plugin:
             if connected:
                 _run("echo 1 > /sys/devices/platform/asus-nb-wmi/egpu_enable")
                 import time; time.sleep(2)
-                _run("echo 1 > /sys/bus/pci/rescan")
+                _run("echo 1 > /sys/bus/pci/rescan", timeout=15)
                 time.sleep(2)
                 vendor_found = _scan_pci_vendor()
                 if vendor_found == "amd":
@@ -365,6 +390,7 @@ class Plugin:
                     log.info(f"install_amd: probe found AMD GPU: {gpu_name}")
 
             _progress(total, total, "AMD support installed.")
+            install_succeeded = True
             return {"success": True, "vendor": "amd", "gpu": gpu_name or "AMD eGPU"}
         except StepError as e:
             _progress(total, total, f"Failed at step {e.step}: {e.msg}")
@@ -375,7 +401,7 @@ class Plugin:
             return {"success": False, "error": str(e)}
         finally:
             _operation = None
-            _install_cleanup()
+            _install_cleanup(keep_sudo=not install_succeeded)
 
     async def install_nvidia(self):
         """Run install in a thread so get_progress() can respond during long steps."""
@@ -412,6 +438,10 @@ class Plugin:
     def _install_nvidia_sync(self):
         global _operation
         _operation = "installing"
+        # Track success so finally can decide whether to keep zz-deck:
+        # on fail we keep it so the user can retry without re-entering the
+        # password (each prompt cycle was the main UX complaint).
+        install_succeeded = False
         total = 8
 
         def step(n, msg, cmd, timeout=300, critical=True):
@@ -435,14 +465,40 @@ class Plugin:
             step(2, "Initializing package keys...",
                  "(pacman-key --init && pacman-key --populate archlinux holo) || "
                  "(rm -rf /etc/pacman.d/gnupg && pacman-key --init && pacman-key --populate archlinux holo)")
+            # Aggressive root-partition cleanup: SteamOS / is only 5GB and
+            # nvidia-utils + linux-headers + dkms need ~1.5GB free. After
+            # 3.8.4 (kernel valve18 + Plasma 6.4) baseline / is ~70% full,
+            # which left ~200MB short. Targets: man/doc/info/help (runtime
+            # unused), other-language locales (keep en/ru), accessibility
+            # data (anthy/espeak/liblouis/ibus-table), AppStream catalog.
+            # Kept: icons, plasma, fonts (sans CJK), firmware.
             step(3, "Freeing disk space...",
-                 "rm -rf /usr/share/fonts/noto-cjk/ /usr/share/wallpapers/* /usr/share/ibus/ 2>/dev/null; true",
+                 "rm -rf "
+                 "/usr/share/man /usr/share/doc /usr/share/info /usr/share/help "
+                 "/usr/share/anthy /usr/share/swcatalog "
+                 "/usr/share/espeak-ng-data /usr/share/speech-dispatcher "
+                 "/usr/share/liblouis /usr/share/ibus-table /usr/share/ibus "
+                 "/usr/share/fonts/noto-cjk /usr/share/wallpapers/* "
+                 "2>/dev/null; "
+                 # Trim locales: keep only en*, ru*, C, POSIX
+                 "find /usr/share/locale -mindepth 1 -maxdepth 1 -type d "
+                 "! -name 'en*' ! -name 'ru*' -exec rm -rf {} + 2>/dev/null; "
+                 # Vacuum journal logs — /var is its own 230MB partition,
+                 # often the bottleneck for DKMS build space.
+                 "journalctl --vacuum-size=10M 2>/dev/null; "
+                 "true",
                  critical=False)
             step(4, "Preparing build environment...", " && ".join([
                 "mkdir -p /home/deck/.xgm/dkms /home/deck/.xgm/pacman-cache /home/deck/.xgm/tmp",
-                "rm -rf /var/lib/dkms 2>/dev/null; ln -sfn /home/deck/.xgm/dkms /var/lib/dkms",
+                # Note: we do NOT symlink /var/lib/dkms here — pacman -S will
+                # install the dkms package next and may overwrite the symlink
+                # with a real directory. Migration happens after pacman -S,
+                # before dkms install — see below.
+                # Wipe the *target* of the cache, not just the symlink — otherwise
+                # corrupted packages from prior failed downloads stay around and
+                # break integrity check on retry.
+                "find /home/deck/.xgm/pacman-cache -mindepth 1 -delete 2>/dev/null; true",
                 "rm -rf /var/cache/pacman/pkg 2>/dev/null; ln -sfn /home/deck/.xgm/pacman-cache /var/cache/pacman/pkg",
-                "rm -rf /usr/share/fonts/noto-cjk/ /usr/share/wallpapers/* /usr/share/ibus/ 2>/dev/null; true",
             ]))
 
             _, kernel = _run_user("uname -r", timeout=5)
@@ -470,6 +526,20 @@ class Plugin:
             log.info(f"install: nvidia-dkms version={nvidia_ver}")
             if not nvidia_ver:
                 raise StepError(6, "nvidia-dkms not found", "Package not found after install")
+
+            # /var is a separate 230MB partition on SteamOS — far too small for
+            # the nvidia DKMS build (~400MB intermediate). Move /var/lib/dkms
+            # to /home (1.3TB) and replace it with a symlink. Must happen AFTER
+            # pacman -S installs the dkms package (pacman would overwrite an
+            # earlier symlink with a real directory), but BEFORE dkms install
+            # generates build files.
+            _run("if [ -d /var/lib/dkms ] && [ ! -L /var/lib/dkms ]; then "
+                 "  mkdir -p /home/deck/.xgm/dkms; "
+                 "  cp -an /var/lib/dkms/. /home/deck/.xgm/dkms/ 2>/dev/null; "
+                 "  rm -rf /var/lib/dkms; "
+                 "  ln -sfn /home/deck/.xgm/dkms /var/lib/dkms; "
+                 "fi; true")
+            log.info(f"install: /var/lib/dkms now -> {os.path.realpath('/var/lib/dkms')}")
 
             # Clean stale DKMS artifacts to avoid "already built" errors
             _run(f"dkms remove nvidia/{nvidia_ver} -k {kernel} 2>/dev/null")
@@ -533,16 +603,19 @@ class Plugin:
             rc_mod2, _ = _run("lsmod | grep '^nvidia '")
             if gpu_name and rc_mod2 == 0:
                 _progress(total, total, f"Done! {gpu_name}")
+                install_succeeded = True
                 return {"success": True, "gpu": gpu_name}
 
             if gpu_name:
                 _progress(total, total, f"GPU on bus: {gpu_name}. Reboot to load driver.")
+                install_succeeded = True
                 return {"success": True, "gpu": gpu_name, "needs_reboot": True}
 
             # Module built but GPU not on bus — needs reboot with dock
             rc_modinfo, _ = _run("modinfo nvidia 2>/dev/null")
             if rc_modinfo == 0:
                 _progress(total, total, "Module built. Reboot with dock connected.")
+                install_succeeded = True
                 return {"success": True, "needs_reboot": True}
 
             # Module didn't build — real failure
@@ -560,7 +633,7 @@ class Plugin:
             return {"success": False, "error": f"{str(e)}\n{error_msg[:500]}"}
         finally:
             _operation = None
-            _install_cleanup()
+            _install_cleanup(keep_sudo=not install_succeeded)
 
     async def activate_egpu(self):
         rc_sudo, _ = _run("echo ok", timeout=5)
@@ -599,7 +672,7 @@ class Plugin:
             time.sleep(2)
 
             log.info("activate_egpu: PCI rescan")
-            rc, out = _run("echo 1 > /sys/bus/pci/rescan")
+            rc, out = _run("echo 1 > /sys/bus/pci/rescan", timeout=15)
             log.info(f"activate_egpu: rescan rc={rc}")
 
             log.info("activate_egpu: waiting 2s for device enumeration")
@@ -654,16 +727,32 @@ class Plugin:
             log.info(f"deactivate_egpu: starting vendor={vendor}")
 
             if vendor == "nvidia":
-                # 1. PCIe remove nvidia devices (must happen before module unload)
-                removed = _pcie_remove_nvidia()
-                log.info(f"deactivate_egpu: PCIe removed {removed} devices")
-
-                # 2. Unload nvidia kernel modules
+                # 1. Unload nvidia modules FIRST. If we PCIe-remove while the
+                #    driver is still bound, `echo > remove` blocks in the
+                #    kernel inside nv_pci_remove → os_delay loop. Unloading
+                #    first lets PCIe remove return immediately.
                 _unload_nvidia()
 
-                # 3. Check if modules actually unloaded
-                rc_mod, _ = _run("lsmod | grep '^nvidia '")
+                # 2. Verify modules actually unloaded. On SteamOS, gamescope
+                #    holds nvidia-drm via DRM client refcount — modprobe -r
+                #    can fail at runtime even with no game running.
+                rc_mod, _ = _run("lsmod | grep '^nvidia '", timeout=5)
                 modules_left = rc_mod == 0
+
+                if modules_left:
+                    # Compositor still holds the driver. Skip PCIe remove —
+                    # doing it now would re-enter the kernel hang. Tell the
+                    # user to reboot to release the dock cleanly.
+                    log.warning("deactivate_egpu: nvidia modules still loaded "
+                                "(gamescope holding drm refcount) — skipping PCIe remove")
+                    return {"result": "partial",
+                            "error": "Compositor is still using NVIDIA driver. "
+                                     "Reboot to safely detach the dock — runtime "
+                                     "deactivate is not supported on SteamOS."}
+
+                # 3. Modules gone — PCIe-remove now is safe and quick
+                removed = _pcie_remove_nvidia()
+                log.info(f"deactivate_egpu: PCIe removed {removed} devices")
             else:
                 # AMD: PCIe-remove the AMD GPU on the dock (skip iGPU at 09:00.0).
                 # amdgpu typically releases cleanly without needing modprobe -r.
@@ -681,10 +770,20 @@ class Plugin:
                 log.info(f"deactivate_egpu: AMD PCIe removed {removed} dock GPUs")
                 modules_left = False
 
-            # ACPI disable (universal)
-            rc, out = _run("echo 0 > /sys/devices/platform/asus-nb-wmi/egpu_enable")
-            if rc != 0:
-                log.warning(f"deactivate_egpu: ACPI disable rc={rc} (may be OK)")
+            # ACPI disable (universal). asus-nb-wmi sometimes returns rc=0
+            # but silently ignores the write if the dGPU was already removed
+            # from the PCIe bus first — verify the value and retry if needed.
+            # Also flip dgpu_disable=1 for the symmetric "off" state.
+            import time
+            for attempt in range(3):
+                rc, _ = _run("echo 0 > /sys/devices/platform/asus-nb-wmi/egpu_enable", timeout=10)
+                time.sleep(0.5)
+                if _read("/sys/devices/platform/asus-nb-wmi/egpu_enable") == "0":
+                    log.info(f"deactivate_egpu: egpu_enable=0 (attempt {attempt + 1})")
+                    break
+                log.warning(f"deactivate_egpu: ACPI write rc={rc} but egpu_enable still 1 (attempt {attempt + 1}/3)")
+                time.sleep(1)
+            _run("echo 1 > /sys/devices/platform/asus-nb-wmi/dgpu_disable", timeout=5)
 
             if modules_left:
                 log.warning("deactivate_egpu: nvidia modules still loaded — reboot recommended")
