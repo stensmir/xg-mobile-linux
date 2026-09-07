@@ -47,26 +47,16 @@ jobs:
           npx tsc --noEmit
           npm run build
 
-      - name: Package plugin tarball
+      - name: Package plugin ZIP
         run: |
-          # Decky expects: tarball whose top-level entry is the plugin folder
-          # (XG-Mobile/), containing plugin.json, main.py, dist/, scripts/, systemd/.
-          # node_modules are NOT shipped — backend runs main.py directly,
-          # the built dist/index.js is what the frontend loads.
+          # Decky's Custom URL installer uses Python ZipFile.
           cd decky-plugin
-          tar --exclude='XG-Mobile/node_modules' \
-              --exclude='*/__pycache__' \
-              --exclude='*.pyc' \
-              --exclude='*/.DS_Store' \
-              --exclude='XG-Mobile/src' \
-              --exclude='XG-Mobile/rollup.config.js' \
-              --exclude='XG-Mobile/tsconfig.json' \
-              --exclude='XG-Mobile/package-lock.json' \
-              -czf ../XG-Mobile.tar.gz XG-Mobile
+          zip -r ../XG-Mobile.zip XG-Mobile \
+            -x '*/node_modules/*' '*/__pycache__/*' '*.pyc' '*/.DS_Store' \
+               'XG-Mobile/src/*' 'XG-Mobile/rollup.config.js' \
+               'XG-Mobile/tsconfig.json' 'XG-Mobile/package-lock.json'
           cd ..
-          ls -la XG-Mobile.tar.gz
-          echo "--- contents ---"
-          tar -tzf XG-Mobile.tar.gz | head -30
+          python3 tests/check_release_archive.py XG-Mobile.zip
 
       - name: Extract release notes from tag annotation
         # Use the annotated tag body as the release description. Falls back
@@ -88,7 +78,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: XG-Mobile.tar.gz
+          files: XG-Mobile.zip
           body_path: ${{ steps.tag_body.outputs.have_body == 'true' && '/tmp/release_body.md' || '' }}
           generate_release_notes: ${{ steps.tag_body.outputs.have_body != 'true' }}
           draft: false

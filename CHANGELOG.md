@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1 — Decky ZIP installation
+
+- Fix the release artifact: Decky Custom URL consumes ZIP, not tar.gz. Publish `XG-Mobile.zip` and validate its manifest, bundled patch/scripts, and archive integrity in CI. Earlier tar.gz assets are not valid Decky Custom URL inputs.
+- Tested Decky 3.2.8 with XG Mobile 0.2.1 in Desktop Mode / Big Picture on the built-in ROG Ally display. The user completed installation through Decky; the plugin panel and backend telemetry confirmed the active RTX 4090.
+- Preserve the current driver installation. This validates plugin installation and UI, not a fresh NVIDIA installation or a Game Mode boot. Decky boot autostart remains disabled. The first external-monitor Big Picture transition went black and was recovered by stopping Decky and restarting Steam; its cause remains unresolved.
+
 ## v0.2.0 — SteamOS 3.8.26 recovery and external HDMI
 
 Verified on ROG Ally Z1 Extreme + XG Mobile GC33Z (RTX 4090 Laptop, 16 GB), SteamOS 3.8.26, kernel 6.18.46-valve1, NVIDIA 575.64.05.
@@ -11,4 +17,4 @@ Verified on ROG Ally Z1 Extreme + XG Mobile GC33Z (RTX 4090 Laptop, 16 GB), Stea
 - Incorporate the HDMI-audio unbind fix before PCIe removal. Stop removal and dock power-off when teardown fails. Remove the competing `xgm-auto` stop teardown; the dedicated shutdown unit owns shutdown cleanup.
 - Explain the external monitor workflow in the plugin panel and document recovery evidence and limitations.
 
-The patched driver and Desktop Mode HDMI path were tested on hardware. The updated installer and shutdown safeguards are covered by focused checks, but a fresh end-to-end plugin installation and reboot with these additional safeguards have not been tested. **Decky Loader remains disabled on the recovery device** because a previous loader/client combination broke SteamUI. This release does not certify current Decky compatibility.
+The patched driver and Desktop Mode HDMI path were tested on hardware. The updated installer and shutdown safeguards are covered by focused checks, but a fresh end-to-end plugin installation and reboot with these additional safeguards have not been tested. At the time of v0.2.0, **Decky Loader remained disabled on the recovery device** because a previous loader/client combination broke SteamUI. This release does not certify current Decky compatibility.

@@ -43,14 +43,16 @@ DRM card and connector numbers can change after reboot. Prefer `/dev/dri/by-path
 
 ## Installation and recovery
 
-**Decky Loader is currently disabled on our recovery device.** A previous Decky/Steam client combination caused SteamUI startup failures. This release updates the plugin but does not certify compatibility with the current Steam client. The eGPU services and Desktop Mode monitor work without Decky running.
+**Decky 3.2.8 + XG Mobile 0.2.1 have now been tested in Desktop Mode / Steam Big Picture on the built-in display.** The ZIP installed through Decky and the panel showed the active RTX 4090 and live telemetry. Decky boot autostart remains disabled pending a separate Game Mode boot test. The eGPU services and Desktop Mode monitor also work without Decky.
+
+The initial Decky/Big Picture transition on the external 4K monitor produced a black screen; stopping Decky and restarting Steam restored output. A later launch in an already running Big Picture session worked. The cause of the first failure is not isolated, so this is a scoped compatibility result, not a claim that every startup path is fixed.
 
 For SteamOS 3.8.26 recovery, start with [the recovery record](RECOVERY-2026-09-07.md). It records a successful manual recovery, not an unattended script to replay. In particular, the 5 GB root partition may need a reviewed storage relocation. The installer now stops on insufficient space or relocated package-owned directories instead of deleting localizations, fonts, help, or accessibility data.
 
-For a system where Decky compatibility has already been established, the plugin is available from [GitHub Releases](https://github.com/stensmir/xg-mobile-linux/releases). Decky's developer Custom URL accepts:
+Use Decky **3.2.8** for the tested setup. The plugin is available from [GitHub Releases](https://github.com/stensmir/xg-mobile-linux/releases). Decky's developer Custom URL accepts:
 
 ```text
-https://github.com/stensmir/xg-mobile-linux/releases/latest/download/XG-Mobile.tar.gz
+https://github.com/stensmir/xg-mobile-linux/releases/latest/download/XG-Mobile.zip
 ```
 
 Open **XG Mobile → Setup** and choose the NVIDIA path. It installs matching Neptune headers, build tools, NVIDIA utilities including 32-bit libraries, and the bundled compatibility patch where applicable. It installs the auto-detect/shutdown services, preserves the Steam display workaround, rebuilds initramfs, and asks for a reboot. The full updated installer has not been rerun on the recovered device, to preserve the working installation.
