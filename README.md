@@ -43,7 +43,7 @@ DRM card and connector numbers can change after reboot. Prefer `/dev/dri/by-path
 
 ## Installation and recovery
 
-**Decky 3.2.8 + XG Mobile 0.2.1 have now been tested in Desktop Mode / Steam Big Picture on the built-in display.** The ZIP installed through Decky and the panel showed the active RTX 4090 and live telemetry. Decky boot autostart remains disabled pending a separate Game Mode boot test. The eGPU services and Desktop Mode monitor also work without Decky.
+**Decky 3.2.8 + XG Mobile 0.2.1 have now been tested in Desktop Mode / Steam Big Picture on the built-in display.** The ZIP installed through Decky and the panel showed the active RTX 4090 and live telemetry. Steam was then restarted; the user confirmed that Big Picture and the plugin panel returned successfully. Decky boot autostart remains disabled pending a separate Game Mode boot test. The eGPU services and Desktop Mode monitor also work without Decky.
 
 The initial Decky/Big Picture transition on the external 4K monitor produced a black screen; stopping Decky and restarting Steam restored output. A later launch in an already running Big Picture session worked. The cause of the first failure is not isolated, so this is a scoped compatibility result, not a claim that every startup path is fixed.
 
