@@ -74,12 +74,12 @@ const C = {
 const INSTALL_STEPS = {
     1: "Unlocking filesystem",
     2: "Initializing keys",
-    3: "Freeing space",
+    3: "Checking free space",
     4: "Build environment",
     5: "Downloading nvidia",
     6: "Compiling module",
     7: "Auto-detection",
-    8: "Loading driver",
+    8: "Ready to reboot",
 };
 // ── Helpers ────────────────────────────────────────────
 const xgToast = (body) => toaster.toast({ title: "⚡ XG Mobile", body });
@@ -319,7 +319,7 @@ const XGMobilePanel = () => {
     const refresh = async () => {
         try {
             const s = await getStatus();
-            setStatus(s);
+            setStatus({ ...s, error: s.error });
             if (s.error)
                 setError(s.error);
         }
@@ -859,7 +859,7 @@ const XGMobilePanel = () => {
                     lineHeight: "1.4",
                     padding: "4px 0",
                 },
-            }, "eGPU active. Reboot to safely detach the dock."))), 
+            }, "eGPU active. Shut down before unplugging. For an external monitor, switch Steam to Desktop Mode, then launch your game there. Game Mode output remains unverified."))),
         // Status rows
         SP_REACT.createElement(DFL.PanelSectionRow, null, SP_REACT.createElement(Card, null, SP_REACT.createElement(StatusRow, {
             label: "Dock",

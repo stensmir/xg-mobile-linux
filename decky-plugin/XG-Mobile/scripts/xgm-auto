@@ -92,43 +92,9 @@ case "${1:-start}" in
         ;;
 
     stop)
-        # Safe removal: PCIe remove the dock GPU first, then unload modules
-        # (nvidia only), then ACPI disable.
-        log "Stopping eGPU (vendor=$VENDOR)..."
-
-        if [ "$VENDOR" = "nvidia" ]; then
-            REMOVE_VENDOR="0x10de"
-        else
-            REMOVE_VENDOR="0x1002"
-        fi
-
-        # PCIe remove dock GPUs (skip iGPU at 09:*)
-        for dev in /sys/bus/pci/devices/*; do
-            vendor=$(cat "$dev/vendor" 2>/dev/null)
-            bdf=$(basename "$dev")
-            if [ "$vendor" = "$REMOVE_VENDOR" ] && [[ "$bdf" != 0000:09:* ]]; then
-                log "Removing PCIe device $bdf"
-                echo 1 > "$dev/remove" 2>/dev/null
-            fi
-        done
-
-        if [ "$VENDOR" = "nvidia" ]; then
-            # Unload nvidia modules (should succeed after PCIe remove)
-            if lsmod | grep -q "^nvidia"; then
-                modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null
-                if lsmod | grep -q "^nvidia"; then
-                    log "WARN: nvidia modules still loaded (non-critical)"
-                else
-                    log "nvidia modules unloaded"
-                fi
-            fi
-        fi
-        # AMD: amdgpu typically releases cleanly on PCIe remove; no module unload.
-
-        if [ -f "$SYSFS_ENABLE" ]; then
-            echo 0 > "$SYSFS_ENABLE" 2>/dev/null
-            log "egpu_enable = 0"
-        fi
+        # Teardown has a dedicated shutdown unit. A second removal path here
+        # raced that unit and could remove a GPU still held by the compositor.
+        log "Stop leaves the dock attached; shut down before unplugging."
         ;;
 
     *)

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Apply only the driver/kernel combination verified on the recovery device.
+set -eu
+kernel=${1:?kernel release required}
+version=${2:?NVIDIA version required}
+source_dir=${3:-/usr/src/nvidia-$version}
+patch_file=$(dirname "$(readlink -f "$0")")/../patches/nvidia-575.64.05-linux-6.18.patch
+
+if [ "$version" != 575.64.05 ]; then
+    echo "No bundled patch for NVIDIA $version; using upstream source."
+    exit 0
+fi
+case "$kernel" in
+    6.18.*) ;;
+    *)
+        if patch --batch --forward --dry-run -R -p1 -d "$source_dir" < "$patch_file" >/dev/null 2>&1; then
+            echo "Source is patched for 6.18; reinstall pristine NVIDIA source for $kernel." >&2
+            exit 1
+        fi
+        echo "No 6.18 patch needed for $kernel."
+        exit 0
+        ;;
+esac
+if patch --batch --forward --dry-run -R -p1 -d "$source_dir" < "$patch_file" >/dev/null 2>&1; then
+    echo "NVIDIA 575.64.05 Linux 6.18 patch already applied."
+    exit 0
+fi
+# A failed preflight must leave every source file untouched.
+patch --batch --forward --dry-run -p1 -d "$source_dir" < "$patch_file"
+patch --batch --forward --backup --suffix=.xgm-original -p1 -d "$source_dir" < "$patch_file"

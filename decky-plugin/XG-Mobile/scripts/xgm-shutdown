@@ -13,7 +13,7 @@
 #   2. Retry modprobe -r every second for up to 15s — gives systemd time to
 #      wind down user@1000 in parallel and release the last refs.
 #   3. Only PCIe-remove if modules are actually unloaded.
-#   4. ACPI disable is universal and always safe.
+#   4. Cut dock power only after successful driver/device teardown.
 
 SYSFS_ENABLE="/sys/devices/platform/asus-nb-wmi/egpu_enable"
 VENDOR_FILE="/home/deck/.config/xgm/vendor"
@@ -51,7 +51,9 @@ if [ "$VENDOR" = "nvidia" ] && lsmod | grep -q "^nvidia"; then
     unloaded=0
     for i in $(seq 1 15); do
         # Re-kill in case new clients appeared (e.g. systemd re-trying)
-        pkill -KILL gamescope steam steamwebhelper Xwayland 2>/dev/null
+        for client in gamescope steam steamwebhelper Xwayland kwin_wayland; do
+            pkill -KILL "$client" 2>/dev/null
+        done
         # Try to unload — short timeout, idempotent
         timeout 3 modprobe -r nvidia-uvm nvidia-drm nvidia-modeset nvidia 2>/dev/null
         if ! lsmod | grep -q "^nvidia"; then
@@ -71,19 +73,37 @@ fi
 # Step 2: PCIe-remove dock GPU(s) only if it's safe (no driver bound).
 # AMD path always reaches here because amdgpu releases cleanly on remove.
 # Skip 0000:09:* (integrated AMD iGPU on Z1 Extreme).
+teardown_failed=$modules_left
 if [ "$modules_left" = "0" ]; then
     for dev in /sys/bus/pci/devices/*; do
         vendor=$(cat "$dev/vendor" 2>/dev/null)
         bdf=$(basename "$dev")
         if [ "$vendor" = "$REMOVE_VENDOR" ] && [[ "$bdf" != 0000:09:* ]]; then
+            # Unbind whatever driver holds this function BEFORE removing it.
+            # The GPU HDMI-audio function (...:00.1) is bound by snd_hda_intel,
+            # which has no AER error_detected callback — removing it while bound
+            # throws an Uncorrectable AER / ACSViol on the upstream port and
+            # hangs the final kernel reboot/poweroff on SteamOS kernel valve23+.
+            # Unbinding first lets the function detach cleanly.
+            if [ -L "$dev/driver" ]; then
+                drv=$(basename "$(readlink "$dev/driver")")
+                log "Unbinding $drv from $bdf"
+                if ! timeout 5 sh -c "echo '$bdf' > '$dev/driver/unbind'" 2>/dev/null || [ -L "$dev/driver" ]; then
+                    log "WARN: $bdf remains bound; skipping removal and dock power-off"
+                    teardown_failed=1
+                    continue
+                fi
+            fi
             log "Removing PCIe device $bdf"
-            timeout 5 sh -c "echo 1 > '$dev/remove'" 2>/dev/null
+            if ! timeout 5 sh -c "echo 1 > '$dev/remove'" 2>/dev/null; then
+                teardown_failed=1
+            fi
         fi
     done
 fi
 
-# Step 3: ACPI disable — cut power to the dock (universal, always safe).
-if [ -f "$SYSFS_ENABLE" ]; then
+# Step 3: Never cut power while a driver or failed removal still holds the dock.
+if [ "$teardown_failed" = "0" ] && [ -f "$SYSFS_ENABLE" ]; then
     timeout 3 sh -c "echo 0 > '$SYSFS_ENABLE'" 2>/dev/null
     log "egpu_enable = 0 (dock powered off)"
 fi

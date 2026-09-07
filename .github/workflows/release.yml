@@ -30,13 +30,22 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Check recovery safeguards
+        run: |
+          python3 tests/test_recovery.py
+          bash -n decky-plugin/XG-Mobile/scripts/xgm-auto
+          bash -n decky-plugin/XG-Mobile/scripts/xgm-shutdown
+          bash -n decky-plugin/XG-Mobile/scripts/xgm-patch-nvidia
+
       - name: Install plugin frontend deps
         working-directory: decky-plugin/XG-Mobile
         run: npm install
 
       - name: Build dist
         working-directory: decky-plugin/XG-Mobile
-        run: npm run build
+        run: |
+          npx tsc --noEmit
+          npm run build
 
       - name: Package plugin tarball
         run: |
@@ -46,6 +55,9 @@ jobs:
           # the built dist/index.js is what the frontend loads.
           cd decky-plugin
           tar --exclude='XG-Mobile/node_modules' \
+              --exclude='*/__pycache__' \
+              --exclude='*.pyc' \
+              --exclude='*/.DS_Store' \
               --exclude='XG-Mobile/src' \
               --exclude='XG-Mobile/rollup.config.js' \
               --exclude='XG-Mobile/tsconfig.json' \

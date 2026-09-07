@@ -158,7 +158,13 @@ def _pcie_remove_nvidia():
             dev_path = os.path.dirname(vendor_path)
             bdf = os.path.basename(dev_path)
             log.info(f"PCIe remove: {bdf}")
-            _run(f"echo 1 > {dev_path}/remove", timeout=10)
+            if os.path.islink(dev_path + "/driver"):
+                rc, out = _run(f"echo {_shquote(bdf)} > {dev_path}/driver/unbind", timeout=5)
+                if rc != 0 or os.path.islink(dev_path + "/driver"):
+                    raise RuntimeError(f"Cannot unbind {bdf}; leave dock connected and shut down.")
+            rc, out = _run(f"echo 1 > {dev_path}/remove", timeout=10)
+            if rc != 0:
+                raise RuntimeError(f"Cannot remove {bdf}; leave dock connected and shut down.")
             removed += 1
     return removed
 
@@ -360,8 +366,7 @@ class Plugin:
 
         try:
             step(1, "Disabling read-only filesystem...",
-                 "steamos-readonly disable; "
-                 "rm -f /var/lib/pacman/db.lck /usr/lib/holo/pacmandb/db.lck 2>/dev/null; true")
+                 "steamos-readonly disable")
             step(2, "Preparing scratch directories...",
                  "mkdir -p /home/deck/.xgm/tmp && chown -R deck:deck /home/deck/.xgm")
             step(3, "Installing auto-detect + safe-shutdown services...",
@@ -454,77 +459,51 @@ class Plugin:
             return rc, out
 
         try:
-            step(1, "Disabling read-only filesystem...",
-                 # Drop stale pacman locks from prior failed runs.
-                 # SteamOS 3.7 used /var/lib/pacman/db.lck; 3.8 moved it to
-                 # /usr/lib/holo/pacmandb/db.lck — clean both, ignore missing.
-                 "steamos-readonly disable; "
-                 "rm -f /var/lib/pacman/db.lck /usr/lib/holo/pacmandb/db.lck 2>/dev/null; true")
-            # If populate fails (half-broken keyring after SteamOS A/B update or
-            # a racing prior run), wipe /etc/pacman.d/gnupg and rebuild from scratch.
-            step(2, "Initializing package keys...",
-                 "(pacman-key --init && pacman-key --populate archlinux holo) || "
-                 "(rm -rf /etc/pacman.d/gnupg && pacman-key --init && pacman-key --populate archlinux holo)")
-            # Aggressive root-partition cleanup: SteamOS / is only 5GB and
-            # nvidia-utils + linux-headers + dkms need ~1.5GB free. After
-            # 3.8.4 (kernel valve18 + Plasma 6.4) baseline / is ~70% full,
-            # which left ~200MB short. Targets: man/doc/info/help (runtime
-            # unused), other-language locales (keep en/ru), accessibility
-            # data (anthy/espeak/liblouis/ibus-table), AppStream catalog.
-            # Kept: icons, plasma, fonts (sans CJK), firmware.
-            step(3, "Freeing disk space...",
-                 "rm -rf "
-                 "/usr/share/man /usr/share/doc /usr/share/info /usr/share/help "
-                 "/usr/share/anthy /usr/share/swcatalog "
-                 "/usr/share/espeak-ng-data /usr/share/speech-dispatcher "
-                 "/usr/share/liblouis /usr/share/ibus-table /usr/share/ibus "
-                 "/usr/share/fonts/noto-cjk /usr/share/wallpapers/* "
-                 "2>/dev/null; "
-                 # Trim locales: keep only en*, ru*, C, POSIX
-                 "find /usr/share/locale -mindepth 1 -maxdepth 1 -type d "
-                 "! -name 'en*' ! -name 'ru*' -exec rm -rf {} + 2>/dev/null; "
-                 # Vacuum journal logs — /var is its own 230MB partition,
-                 # often the bottleneck for DKMS build space.
-                 "journalctl --vacuum-size=10M 2>/dev/null; "
-                 "true",
-                 critical=False)
-            step(4, "Preparing build environment...", " && ".join([
-                "mkdir -p /home/deck/.xgm/dkms /home/deck/.xgm/pacman-cache /home/deck/.xgm/tmp",
-                # Note: we do NOT symlink /var/lib/dkms here — pacman -S will
-                # install the dkms package next and may overwrite the symlink
-                # with a real directory. Migration happens after pacman -S,
-                # before dkms install — see below.
-                # Wipe the *target* of the cache, not just the symlink — otherwise
-                # corrupted packages from prior failed downloads stay around and
-                # break integrity check on retry.
-                "find /home/deck/.xgm/pacman-cache -mindepth 1 -delete 2>/dev/null; true",
-                "rm -rf /var/cache/pacman/pkg 2>/dev/null; ln -sfn /home/deck/.xgm/pacman-cache /var/cache/pacman/pkg",
-            ]))
-
             _, kernel = _run_user("uname -r", timeout=5)
             kernel = kernel.strip()
-            log.info(f"install: kernel={kernel}")
-            m = re.search(r"neptune-(\d+)", kernel)
-            kver = m.group(1) if m else "616"
-            headers_pkg = "linux-neptune-" + kver + "-headers"
-            log.info(f"install: headers_pkg={headers_pkg}")
+            m = re.fullmatch(r"[0-9][A-Za-z0-9.+_-]*neptune-(\d+)[A-Za-z0-9.+_-]*", kernel)
+            if not m:
+                raise StepError(1, "Unsupported kernel", "Cannot determine matching Neptune headers: " + kernel)
+            headers_pkg = "linux-neptune-" + m.group(1) + "-headers"
+            # Do not destroy system data or bypass pacman's file conflict checks.
+            # Relocated package-owned directories need the documented manual path.
+            for path in ("/usr/share/locale", "/usr/lib/gcc", "/var/lib/dkms"):
+                if os.path.islink(path):
+                    raise StepError(1, "Manual recovery required",
+                                    path + " is relocated. Follow RECOVERY-2026-09-07.md; do not force pacman overwrite.")
+            if any(os.path.exists(path) for path in (
+                    "/var/lib/pacman/db.lck", "/usr/lib/holo/pacmandb/db.lck")):
+                raise StepError(1, "Package manager is locked", "Finish the other package operation before retrying.")
+            step(1, "Disabling read-only filesystem...", "steamos-readonly disable")
+            step(2, "Initializing package keys...",
+                 "pacman-key --init && pacman-key --populate archlinux holo")
+            step(3, "Checking free space...",
+                 "test $(df -Pk / | awk 'NR==2 {print $4}') -ge 1572864 || "
+                 "{ echo 'At least 1.5 GiB free on / required. Follow the manual recovery guide; no system files were deleted.'; exit 1; }")
+            step(4, "Preparing build environment...",
+                 "mkdir -p /home/deck/.xgm/tmp /home/xgm-system/pacman-cache && "
+                 "chmod 755 /home/xgm-system /home/xgm-system/pacman-cache")
+            package_rc, package_out = step(5, "Installing driver and build packages...",
+                 "pacman -S --needed --noconfirm --cachedir /home/xgm-system/pacman-cache "
+                 + headers_pkg + " dkms gcc make patch nvidia-dkms nvidia-utils lib32-nvidia-utils",
+                 timeout=900, critical=False)
 
-            rc, out = step(5, "Downloading nvidia (~400MB)...",
-                          "pacman -S --noconfirm --overwrite '*' " + headers_pkg + " nvidia-dkms nvidia-utils opencl-nvidia",
-                          timeout=600, critical=False)
-
-            if rc != 0:
-                # Retry without opencl — nvidia-utils IS critical (provides Vulkan ICD for games)
-                step(5, "Retrying core packages...",
-                     "pacman -S --noconfirm --overwrite '*' " + headers_pkg + " nvidia-dkms nvidia-utils",
-                     timeout=600)
+            # pacman can install nvidia-utils even if a later hook fails.
+            # Disable global EGL registration before propagating package errors.
+            step(5, "Preserving Steam display compatibility...",
+                 'mkdir -p /home/xgm-system/nvidia-config-backup && '
+                 'for f in /usr/share/glvnd/egl_vendor.d/10_nvidia.json '
+                 '/usr/lib/udev/rules.d/60-nvidia.rules /usr/lib/modprobe.d/nvidia-sleep.conf; do '
+                 'if [ -f "$f" ]; then cp -an "$f" /home/xgm-system/nvidia-config-backup/ && rm "$f" || exit 1; fi; done')
+            if package_rc != 0:
+                raise StepError(5, "Package installation failed", package_out)
 
             # DKMS build — clean stale artifacts first, then build
             _, nvidia_ver_raw = _run_user("pacman -Q nvidia-dkms 2>/dev/null")
             nvidia_ver_raw = nvidia_ver_raw.strip()
             nvidia_ver = nvidia_ver_raw.split()[1].split("-")[0] if nvidia_ver_raw else ""
             log.info(f"install: nvidia-dkms version={nvidia_ver}")
-            if not nvidia_ver:
+            if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", nvidia_ver):
                 raise StepError(6, "nvidia-dkms not found", "Package not found after install")
 
             # /var is a separate 230MB partition on SteamOS — far too small for
@@ -533,13 +512,14 @@ class Plugin:
             # pacman -S installs the dkms package (pacman would overwrite an
             # earlier symlink with a real directory), but BEFORE dkms install
             # generates build files.
-            _run("if [ -d /var/lib/dkms ] && [ ! -L /var/lib/dkms ]; then "
-                 "  mkdir -p /home/deck/.xgm/dkms; "
-                 "  cp -an /var/lib/dkms/. /home/deck/.xgm/dkms/ 2>/dev/null; "
-                 "  rm -rf /var/lib/dkms; "
-                 "  ln -sfn /home/deck/.xgm/dkms /var/lib/dkms; "
-                 "fi; true")
-            log.info(f"install: /var/lib/dkms now -> {os.path.realpath('/var/lib/dkms')}")
+            step(6, "Preparing DKMS storage...",
+                 "if [ -d /var/lib/dkms ] && [ ! -L /var/lib/dkms ]; then "
+                 "mkdir -p /home/xgm-system/dkms && "
+                 "cp -a /var/lib/dkms/. /home/xgm-system/dkms/ && "
+                 "rm -rf /var/lib/dkms && ln -s /home/xgm-system/dkms /var/lib/dkms; fi")
+            step(6, "Applying kernel compatibility patch...",
+                 f"bash {_shquote(PLUGIN_SCRIPTS + '/xgm-patch-nvidia')} "
+                 f"{_shquote(kernel)} {_shquote(nvidia_ver)}")
 
             # Clean stale DKMS artifacts to avoid "already built" errors
             _run(f"dkms remove nvidia/{nvidia_ver} -k {kernel} 2>/dev/null")
@@ -549,7 +529,7 @@ class Plugin:
                  timeout=600)
 
             # Verify module actually built
-            rc_mod, _ = _run("modinfo nvidia 2>/dev/null")
+            rc_mod, _ = _run(f"modinfo -k {_shquote(kernel)} nvidia 2>/dev/null")
             if rc_mod != 0:
                 raise StepError(6, "Module not found after DKMS build",
                                 "DKMS reported success but nvidia.ko not found. Check kernel headers match.")
@@ -563,8 +543,6 @@ class Plugin:
             # not curl-from-github — keeps the plugin self-contained and works with private repos.
             step(7, "Configuring auto-detection...",
                  # nvidia-utils EGL vendor crashes gamescope — remove EGL/udev, keep Vulkan ICD
-                 'rm -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json '
-                 '/usr/lib/udev/rules.d/60-nvidia.rules /usr/lib/modprobe.d/nvidia-sleep.conf && '
                  'echo "blacklist nouveau" > /etc/modprobe.d/blacklist-nouveau.conf && '
                  'echo "blacklist nvidia-drm" > /etc/modprobe.d/blacklist-nvidia-drm.conf && '
                  'rm -f /etc/modprobe.d/nvidia.conf /etc/modules-load.d/nvidia.conf && '
@@ -572,56 +550,16 @@ class Plugin:
                  f'install -m 755 "{PLUGIN_SCRIPTS}/xgm-shutdown" /usr/local/bin/xgm-shutdown && '
                  f'install -m 644 "{PLUGIN_SYSTEMD}/xg-mobile-auto.service" /etc/systemd/system/xg-mobile-auto.service && '
                  f'install -m 644 "{PLUGIN_SYSTEMD}/xg-mobile-shutdown.service" /etc/systemd/system/xg-mobile-shutdown.service && '
-                 'systemctl daemon-reload && systemctl enable xg-mobile-auto.service xg-mobile-shutdown.service',
-                 critical=False)
+                 'systemctl daemon-reload && systemctl enable xg-mobile-auto.service xg-mobile-shutdown.service && mkinitcpio -P',
+                 timeout=600)
 
-            step(8, "Loading nvidia driver...",
-                 "modprobe nvidia && modprobe nvidia-uvm && modprobe nvidia-drm modeset=1",
-                 critical=False)
-
-            _write_vendor("nvidia")
-            log.info("install: vendor=nvidia recorded")
-
-            # ── Verification (prefer nvidia-smi if available, fallback to sysfs) ──
-            gpu_name = ""
-            try:
-                import glob as g
-                for vendor_path in g.glob("/sys/bus/pci/devices/*/vendor"):
-                    if _read(vendor_path) == "0x10de":
-                        dev_path = os.path.dirname(vendor_path)
-                        bdf = os.path.basename(dev_path)
-                        # Try to get device name from lspci
-                        rc_lspci, lspci_out = _run(f"lspci -s {bdf} 2>/dev/null")
-                        if rc_lspci == 0 and lspci_out.strip():
-                            gpu_name = lspci_out.strip().split(":", 2)[-1].strip() if ":" in lspci_out else bdf
-                        else:
-                            gpu_name = f"NVIDIA GPU [{bdf}]"
-                        break
-            except Exception:
-                pass
-
-            rc_mod2, _ = _run("lsmod | grep '^nvidia '")
-            if gpu_name and rc_mod2 == 0:
-                _progress(total, total, f"Done! {gpu_name}")
-                install_succeeded = True
-                return {"success": True, "gpu": gpu_name}
-
-            if gpu_name:
-                _progress(total, total, f"GPU on bus: {gpu_name}. Reboot to load driver.")
-                install_succeeded = True
-                return {"success": True, "gpu": gpu_name, "needs_reboot": True}
-
-            # Module built but GPU not on bus — needs reboot with dock
-            rc_modinfo, _ = _run("modinfo nvidia 2>/dev/null")
-            if rc_modinfo == 0:
-                _progress(total, total, "Module built. Reboot with dock connected.")
-                install_succeeded = True
-                return {"success": True, "needs_reboot": True}
-
-            # Module didn't build — real failure
-            rc_load, load_err = _run("modprobe nvidia 2>&1")
-            _progress(total, total, f"Driver failed to load: {load_err[:200]}")
-            return {"success": False, "error": f"Module built but won't load: {load_err[:300]}"}
+            # Keep the active display session intact. The boot auto-detect service
+            # binds the dock after reboot; never evict nouveau from a live session.
+            if not _write_vendor("nvidia"):
+                raise StepError(8, "Cannot save dock vendor", VENDOR_FILE)
+            _progress(8, total, "Driver built. Reboot with the dock connected.")
+            install_succeeded = True
+            return {"success": True, "needs_reboot": True}
 
         except StepError as e:
             _progress(total, total, f"Failed at step {e.step}: {e.msg}")

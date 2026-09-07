@@ -1,6 +1,6 @@
 {
   "name": "xg-mobile",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "XG Mobile eGPU control for Decky Loader",
   "type": "module",
   "scripts": {

@@ -1,0 +1,75 @@
+--- a/conftest.sh
++++ b/conftest.sh
+@@ -2490,6 +2490,7 @@
+             #include <drm/drm_crtc_helper.h>
+             void drm_helper_mode_fill_fb_struct(struct drm_device *dev,
+                                                 struct drm_framebuffer *fb,
++                                                const struct drm_format_info *info,
+                                                 const struct drm_mode_fb_cmd2 *mode_cmd)
+             {
+                 return;
+@@ -2516,6 +2517,7 @@
+                 echo "$CONFTEST_PREAMBLE
+                 #include <drm/drm_crtc_helper.h>
+                 void drm_helper_mode_fill_fb_struct(struct drm_framebuffer *fb,
++                                                    const struct drm_format_info *info,
+                                                     const struct drm_mode_fb_cmd2 *mode_cmd)
+                 {
+                     return;
+--- a/nvidia-drm/nvidia-drm-drv.c
++++ b/nvidia-drm/nvidia-drm-drv.c
+@@ -212,6 +212,7 @@
+ static struct drm_framebuffer *nv_drm_framebuffer_create(
+     struct drm_device *dev,
+     struct drm_file *file,
++    const struct drm_format_info *info,
+     #if defined(NV_DRM_HELPER_MODE_FILL_FB_STRUCT_HAS_CONST_MODE_CMD_ARG)
+     const struct drm_mode_fb_cmd2 *cmd
+     #else
+@@ -227,6 +228,7 @@
+     fb = nv_drm_internal_framebuffer_create(
+             dev,
+             file,
++            info,
+             &local_cmd);
+ 
+     #if !defined(NV_DRM_HELPER_MODE_FILL_FB_STRUCT_HAS_CONST_MODE_CMD_ARG)
+--- a/nvidia-drm/nvidia-drm-fb.c
++++ b/nvidia-drm/nvidia-drm-fb.c
+@@ -257,6 +257,7 @@
+ struct drm_framebuffer *nv_drm_internal_framebuffer_create(
+     struct drm_device *dev,
+     struct drm_file *file,
++    const struct drm_format_info *info,
+     struct drm_mode_fb_cmd2 *cmd)
+ {
+     struct nv_drm_device *nv_dev = to_nv_device(dev);
+@@ -310,6 +311,7 @@
+         dev,
+         #endif
+         &nv_fb->base,
++        info,
+         cmd);
+ 
+     /*
+--- a/nvidia-drm/nvidia-drm-fb.h
++++ b/nvidia-drm/nvidia-drm-fb.h
+@@ -84,6 +84,7 @@
+ struct drm_framebuffer *nv_drm_internal_framebuffer_create(
+     struct drm_device *dev,
+     struct drm_file *file,
++    const struct drm_format_info *info,
+     struct drm_mode_fb_cmd2 *cmd);
+ 
+ #endif /* NV_DRM_ATOMIC_MODESET_AVAILABLE */
+--- a/nvidia-drm/nvidia-drm-gem-user-memory.c
++++ b/nvidia-drm/nvidia-drm-gem-user-memory.c
+@@ -157,7 +157,7 @@
+ #if !defined(NV_LINUX)
+     return vmf_insert_pfn(vma, address, pfn);
+ #elif defined(NV_VMF_INSERT_MIXED_PRESENT)
+-    return vmf_insert_mixed(vma, address, pfn_to_pfn_t(pfn));
++    return vmf_insert_mixed(vma, address, pfn);
+ #else
+     return __nv_vm_insert_mixed_helper(vma, address, pfn);
+ #endif
